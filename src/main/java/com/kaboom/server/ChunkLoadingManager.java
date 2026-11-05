@@ -127,6 +127,18 @@ public class ChunkLoadingManager {
 
             entry.enqueued = false;
 
+            Map<ChunkPos, ChunkEntry> dimensionChunks =
+                    chunks.get(entry.dimensionId);
+
+            if (dimensionChunks == null ||
+                    dimensionChunks.get(entry.pos) != entry) {
+                continue;
+            }
+
+            if (System.nanoTime() - entry.retainUntil >= 0) {
+                continue;
+            }
+
             if (entry.status != ChunkStatus.QUEUED) {
                 continue;
             }
