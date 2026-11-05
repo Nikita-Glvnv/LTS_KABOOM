@@ -1,0 +1,16 @@
+[
+{
+  "modid": "lts_kaboom",
+  "name": "LTS_KABOOM",
+  "description": "LooksToSunrise Explosion mod. Custom explosion engine",
+  "version": "${version}",
+  "mcversion": "${mcversion}",
+  "url": "",
+  "updateUrl": "",
+  "authorList": ["LooksToSunrise"],
+  "credits": "The Forge and FML guys, for making this example",
+  "logoFile": "",
+  "screenshots": [],
+  "dependencies": []
+}
+]
