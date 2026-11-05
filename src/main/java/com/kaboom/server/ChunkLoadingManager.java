@@ -35,7 +35,6 @@ public class ChunkLoadingManager {
         ChunkStatus status = ChunkStatus.QUEUED;
         final int dimensionId;
         long retainUntil;
-        int activeUsers;
         ForgeChunkManager.Ticket ticket;
         boolean forced;
         boolean enqueued;
@@ -105,6 +104,9 @@ public class ChunkLoadingManager {
                     entry.retainUntil,
                     expiration
             );
+            if (entry.status == ChunkStatus.FAILED) {
+                entry.status = ChunkStatus.QUEUED;
+            }
 
             if (entry.status == ChunkStatus.QUEUED && !entry.enqueued) {
                 pendingLoads.addLast(entry);
@@ -215,6 +217,8 @@ public class ChunkLoadingManager {
         }
     }
 
+    private int cleanupTickCounter;
+
     @SubscribeEvent
     public void onServerTick(TickEvent.ServerTickEvent event) {
 
@@ -224,6 +228,10 @@ public class ChunkLoadingManager {
 
         processIncomingRequests();
         processPendingLoads();
+        if (++cleanupTickCounter >= 20) {
+            cleanupTickCounter = 0;
+            processExpiredChunks();
+        }
     }
 
     //удержание чанков
@@ -270,5 +278,52 @@ public class ChunkLoadingManager {
         return ticket;
     }
 
+    private void processExpiredChunks() {
 
+        long now = System.nanoTime();
+
+        Iterator<Map.Entry<Integer, Map<ChunkPos, ChunkEntry>>> dimensions =
+                chunks.entrySet().iterator();
+
+        while (dimensions.hasNext()) {
+
+            Map<ChunkPos, ChunkEntry> dimensionChunks =
+                    dimensions.next().getValue();
+
+            Iterator<ChunkEntry> iterator =
+                    dimensionChunks.values().iterator();
+
+            while (iterator.hasNext()) {
+
+                ChunkEntry entry = iterator.next();
+
+                if (now - entry.retainUntil < 0) {
+                    continue;
+                }
+
+                releaseChunkHold(entry);
+                iterator.remove();
+            }
+
+            if (dimensionChunks.isEmpty()) {
+                dimensions.remove();
+            }
+        }
+    }
+
+    public void stop() {
+
+        for (List<ForgeChunkManager.Ticket> dimensionTickets
+                : tickets.values()) {
+
+            for (ForgeChunkManager.Ticket ticket : dimensionTickets) {
+                ForgeChunkManager.releaseTicket(ticket);
+            }
+        }
+
+        tickets.clear();
+        chunks.clear();
+        pendingLoads.clear();
+        incomingRequests.clear();
+    }
 }
