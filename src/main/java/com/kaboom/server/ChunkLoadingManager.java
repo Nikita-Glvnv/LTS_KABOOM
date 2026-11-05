@@ -4,6 +4,7 @@ import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.WorldServer;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraftforge.common.DimensionManager;
+import net.minecraftforge.event.world.WorldEvent;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
@@ -86,6 +87,12 @@ public class ChunkLoadingManager {
                 break;
             }
 
+            if (DimensionManager.getWorld(
+                    request.dimensionId, false
+            ) == null) {
+                continue;
+            }
+
             Map<ChunkPos, ChunkEntry> dimensionChunks =
                     chunks.computeIfAbsent(
                             request.dimensionId,
@@ -157,6 +164,10 @@ public class ChunkLoadingManager {
 
             if (ticket == null) {
                 entry.status = ChunkStatus.FAILED;
+                LOGGER.warn(
+                        "No available ticket: dimension={}, pos={}",
+                        entry.dimensionId, entry.pos
+                );
                 continue;
             }
 
@@ -188,6 +199,10 @@ public class ChunkLoadingManager {
                 }
 
                 entry.status = ChunkStatus.READY;
+                LOGGER.info(
+                        "Chunk READY: dimension={}, pos={}",
+                        entry.dimensionId, entry.pos
+                );
 
             } catch (Exception e) {
                 releaseChunkHold(entry);
@@ -207,6 +222,10 @@ public class ChunkLoadingManager {
 
         if (ticket.getChunkList().contains(entry.pos)) {
             ForgeChunkManager.unforceChunk(ticket, entry.pos);
+            LOGGER.info(
+                    "Chunk RELEASED: dimension={}, pos={}",
+                    entry.dimensionId, entry.pos
+            );
         }
 
         entry.ticket = null;
@@ -229,6 +248,50 @@ public class ChunkLoadingManager {
         }
     }
 
+    private void releaseDimension(int dimensionId) {
+
+        Map<ChunkPos, ChunkEntry> removedChunks =
+                chunks.remove(dimensionId);
+
+        pendingLoads.removeIf(
+                entry -> entry.dimensionId == dimensionId
+        );
+
+        incomingRequests.removeIf(
+                request -> request.dimensionId == dimensionId
+        );
+
+        List<ForgeChunkManager.Ticket> dimensionTickets =
+                tickets.remove(dimensionId);
+
+        int releasedTickets = 0;
+
+        if (dimensionTickets != null) {
+
+            for (ForgeChunkManager.Ticket ticket : dimensionTickets) {
+
+                if (!ticket.getChunkList().isEmpty()) {
+                    LOGGER.error(
+                            "Dimension {} unloaded with {} chunks still forced",
+                            dimensionId,
+                            ticket.getChunkList().size()
+                    );
+                    continue;
+                }
+
+                ForgeChunkManager.releaseTicket(ticket);
+                releasedTickets++;
+            }
+        }
+
+        LOGGER.info(
+                "Dimension cleanup: dimension={}, entries={}, tickets={}",
+                dimensionId,
+                removedChunks == null ? 0 : removedChunks.size(),
+                releasedTickets
+        );
+    }
+
     private int cleanupTickCounter;
 
     @SubscribeEvent
@@ -244,6 +307,19 @@ public class ChunkLoadingManager {
             cleanupTickCounter = 0;
             processExpiredChunks();
         }
+    }
+
+    @SubscribeEvent
+    public void onWorldUnload(WorldEvent.Unload event) {
+
+        if (!(event.getWorld() instanceof WorldServer)) {
+            return;
+        }
+
+        int dimensionId = event.getWorld()
+                .provider.getDimension();
+
+        releaseDimension(dimensionId);
     }
 
     //удержание чанков
