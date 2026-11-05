@@ -1,12 +1,24 @@
 package com.kaboom.server;
 
 import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.WorldServer;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraftforge.common.DimensionManager;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import net.minecraftforge.fml.common.gameevent.TickEvent;
+import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 
 public class ChunkLoadingManager {
+    private static final int MAX_CHUNKS_PER_TICK = 2;
+
+    private static final Logger LOGGER =
+            LogManager.getLogger("LTS_KABOOM");
+
     private enum ChunkStatus {
         QUEUED,
         LOADING,
@@ -97,6 +109,82 @@ public class ChunkLoadingManager {
                 entry.enqueued = true;
             }
         }
+    }
+
+    private void processPendingLoads() {
+
+        for (int i = 0; i < MAX_CHUNKS_PER_TICK; i++) {
+
+            ChunkEntry entry = pendingLoads.pollFirst();
+
+            if (entry == null) {
+                break;
+            }
+
+            entry.enqueued = false;
+
+            if (entry.status != ChunkStatus.QUEUED) {
+                continue;
+            }
+
+            WorldServer world =
+                    DimensionManager.getWorld(entry.dimensionId);
+
+            if (world == null) {
+                entry.status = ChunkStatus.FAILED;
+                continue;
+            }
+
+            entry.status = ChunkStatus.LOADING;
+
+            try {
+                Chunk chunk = world.getChunkProvider()
+                        .getLoadedChunk(entry.pos.x, entry.pos.z);
+
+                if (chunk == null) {
+                    chunk = world.getChunkFromChunkCoords(
+                            entry.pos.x,
+                            entry.pos.z
+                    );
+                }
+
+                if (chunk == null) {
+                    entry.status = ChunkStatus.FAILED;
+                    continue;
+                }
+
+                entry.status = ChunkStatus.READY;
+
+                LOGGER.debug(
+                        "Chunk loaded: dimension={}, x={}, z={}",
+                        entry.dimensionId,
+                        entry.pos.x,
+                        entry.pos.z
+                );
+
+            } catch (Exception e) {
+
+                entry.status = ChunkStatus.FAILED;
+
+                LOGGER.error(
+                        "Failed to load chunk: dimension={}, pos={}",
+                        entry.dimensionId,
+                        entry.pos,
+                        e
+                );
+            }
+        }
+    }
+
+    @SubscribeEvent
+    public void onServerTick(TickEvent.ServerTickEvent event) {
+
+        if (event.phase != TickEvent.Phase.END) {
+            return;
+        }
+
+        processIncomingRequests();
+        processPendingLoads();
     }
 
 }

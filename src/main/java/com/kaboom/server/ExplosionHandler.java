@@ -65,6 +65,10 @@ public class ExplosionHandler {
 
         if (worker != null) {
             worker.submitExplosion(pos, power);
+        } else {
+            throw new IllegalStateException(
+                    "No DimensionWorker for dimension " + dimensionId
+            );
         }
     }
 }
