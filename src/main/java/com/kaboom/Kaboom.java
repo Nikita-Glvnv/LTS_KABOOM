@@ -3,6 +3,7 @@ package com.kaboom;
 import com.kaboom.commands.boomstickcommads;
 import com.kaboom.server.ExplosionHandler;
 import net.minecraft.init.Blocks;
+import net.minecraftforge.common.ForgeChunkManager;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.Mod.EventHandler;
 import net.minecraftforge.fml.common.event.*;
@@ -24,6 +25,15 @@ public class Kaboom
     @EventHandler
     public void preInit(FMLPreInitializationEvent event)
     {
+        ForgeChunkManager.setForcedChunkLoadingCallback(
+                this,
+                (restoredTickets, world) -> {
+
+                    for (ForgeChunkManager.Ticket ticket : restoredTickets) {
+                        ForgeChunkManager.releaseTicket(ticket);
+                    }
+                }
+        );
         logger = event.getModLog();
     }
 
@@ -51,4 +61,7 @@ public class Kaboom
             explosionHandler = null;
         }
     }
+
+    @Mod.Instance(Kaboom.MODID)
+    public static Kaboom INSTANCE;
 }

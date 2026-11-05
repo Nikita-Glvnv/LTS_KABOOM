@@ -8,6 +8,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+import com.kaboom.Kaboom;
+import net.minecraftforge.common.ForgeChunkManager;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -34,7 +36,7 @@ public class ChunkLoadingManager {
         final int dimensionId;
         long retainUntil;
         int activeUsers;
-
+        ForgeChunkManager.Ticket ticket;
         boolean forced;
         boolean enqueued;
 
@@ -137,7 +139,26 @@ public class ChunkLoadingManager {
 
             entry.status = ChunkStatus.LOADING;
 
+            ForgeChunkManager.Ticket ticket = getAvailableTicket(world);
+
+            if (ticket == null) {
+                entry.status = ChunkStatus.FAILED;
+                continue;
+            }
+
+            entry.ticket = ticket;
+
             try {
+                ForgeChunkManager.forceChunk(ticket, entry.pos);
+
+                if (!ticket.getChunkList().contains(entry.pos)) {
+                    throw new IllegalStateException(
+                            "Chunk was not registered in ticket"
+                    );
+                }
+
+                entry.forced = true;
+
                 Chunk chunk = world.getChunkProvider()
                         .getLoadedChunk(entry.pos.x, entry.pos.z);
 
@@ -149,29 +170,47 @@ public class ChunkLoadingManager {
                 }
 
                 if (chunk == null) {
-                    entry.status = ChunkStatus.FAILED;
-                    continue;
+                    throw new IllegalStateException("Chunk loading failed");
                 }
 
                 entry.status = ChunkStatus.READY;
 
-                LOGGER.debug(
-                        "Chunk loaded: dimension={}, x={}, z={}",
-                        entry.dimensionId,
-                        entry.pos.x,
-                        entry.pos.z
-                );
-
             } catch (Exception e) {
-
+                releaseChunkHold(entry);
                 entry.status = ChunkStatus.FAILED;
+                LOGGER.error("Chunk loading failed: {}", entry.pos, e);
+            }
+        }
+    }
 
-                LOGGER.error(
-                        "Failed to load chunk: dimension={}, pos={}",
-                        entry.dimensionId,
-                        entry.pos,
-                        e
-                );
+    private void releaseChunkHold(ChunkEntry entry) {
+
+        ForgeChunkManager.Ticket ticket = entry.ticket;
+
+        if (ticket == null) {
+            return;
+        }
+
+        if (ticket.getChunkList().contains(entry.pos)) {
+            ForgeChunkManager.unforceChunk(ticket, entry.pos);
+        }
+
+        entry.ticket = null;
+        entry.forced = false;
+
+        if (ticket.getChunkList().isEmpty()) {
+
+            ForgeChunkManager.releaseTicket(ticket);
+
+            List<ForgeChunkManager.Ticket> dimensionTickets =
+                    tickets.get(entry.dimensionId);
+
+            if (dimensionTickets != null) {
+                dimensionTickets.remove(ticket);
+
+                if (dimensionTickets.isEmpty()) {
+                    tickets.remove(entry.dimensionId);
+                }
             }
         }
     }
@@ -186,5 +225,50 @@ public class ChunkLoadingManager {
         processIncomingRequests();
         processPendingLoads();
     }
+
+    //удержание чанков
+
+    private final Map<Integer, List<ForgeChunkManager.Ticket>> tickets =
+            new HashMap<>();
+
+    private static final int MAX_CHUNKS_PER_TICKET = 25;
+
+    private ForgeChunkManager.Ticket getAvailableTicket(WorldServer world) {
+
+        int dimensionId = world.provider.getDimension();
+
+        List<ForgeChunkManager.Ticket> dimensionTickets =
+                tickets.computeIfAbsent(
+                        dimensionId,
+                        id -> new ArrayList<>()
+                );
+
+        for (ForgeChunkManager.Ticket ticket : dimensionTickets) {
+
+            int depth = ticket.getChunkListDepth();
+
+            int limit = depth > 0
+                    ? Math.min(depth, MAX_CHUNKS_PER_TICKET)
+                    : MAX_CHUNKS_PER_TICKET;
+
+            if (ticket.getChunkList().size() < limit) {
+                return ticket;
+            }
+        }
+
+        ForgeChunkManager.Ticket ticket =
+                ForgeChunkManager.requestTicket(
+                        Kaboom.INSTANCE,
+                        world,
+                        ForgeChunkManager.Type.NORMAL
+                );
+
+        if (ticket != null) {
+            dimensionTickets.add(ticket);
+        }
+
+        return ticket;
+    }
+
 
 }
