@@ -252,4 +252,149 @@ public class oktoderevo {
             result.resistance = 0;
         }
     }
+
+    private void exportNode(
+            int node,
+            int x0, int y0, int z0,
+            int size,
+            byte[] types,
+            float[] hardnessOutput,
+            float[] resistanceOutput
+    ) {
+        byte type = nodeType[node];
+
+        // Воздух уже представлен нулями во входных массивах.
+        if (type == AIR) {
+            return;
+        }
+
+        // Конечный блок.
+        if (size == 1) {
+
+            if (type != BLOCK && type != LIQUID) {
+                throw new IllegalStateException("Invalid leaf type");
+            }
+
+            int index = (y0 << 8) | (z0 << 4) | x0;
+
+            types[index] = type;
+
+            if (type == BLOCK) {
+                hardnessOutput[index] = hardness[node];
+                resistanceOutput[index] = resistance[node];
+            }
+
+            return;
+        }
+
+        if (type != BRANCH) {
+            throw new IllegalStateException("Invalid octree structure");
+        }
+
+        int half = size >>> 1;
+        int mask = childMask[node] & 0xFF;
+        int child = firstChild[node];
+
+        while (mask != 0) {
+
+            int octant = Integer.numberOfTrailingZeros(mask);
+
+            int x = x0 + ((octant & 1) != 0 ? half : 0);
+            int y = y0 + ((octant & 4) != 0 ? half : 0);
+            int z = z0 + ((octant & 2) != 0 ? half : 0);
+
+            exportNode(
+                    child++,
+                    x, y, z,
+                    half,
+                    types,
+                    hardnessOutput,
+                    resistanceOutput
+            );
+
+            // Удаляем младший установленный бит маски.
+            mask &= mask - 1;
+        }
+    }
+
+    public void applyChanges(
+            short[] positions,
+            byte[] types,
+            float[] hardnessInput,
+            float[] resistanceInput,
+            int count
+    ) {
+        if (positions == null || types == null
+                || hardnessInput == null || resistanceInput == null
+                || count < 0
+                || count > positions.length
+                || count > types.length
+                || count > hardnessInput.length
+                || count > resistanceInput.length) {
+
+            throw new IllegalArgumentException("Invalid change arrays");
+        }
+
+        if (count == 0) {
+            return;
+        }
+
+        // Проверяем пакет до изменения дерева.
+        for (int i = 0; i < count; i++) {
+
+            int index = positions[i] & 0xFFFF;
+            byte type = types[i];
+
+            if (index >= 4096) {
+                throw new IllegalArgumentException(
+                        "Invalid block position: " + index
+                );
+            }
+
+            if (type != AIR && type != BLOCK && type != LIQUID) {
+                throw new IllegalArgumentException(
+                        "Invalid block type: " + type
+                );
+            }
+        }
+
+        // Временные массивы всей секции.
+        byte[] currentTypes = new byte[4096];
+        float[] currentHardness = new float[4096];
+        float[] currentResistance = new float[4096];
+
+        // Восстанавливаем текущие данные.
+        exportNode(
+                0,
+                0, 0, 0,
+                16,
+                currentTypes,
+                currentHardness,
+                currentResistance
+        );
+
+        // Применяем все изменения.
+        for (int i = 0; i < count; i++) {
+
+            int index = positions[i] & 0xFFFF;
+            byte type = types[i];
+
+            currentTypes[index] = type;
+
+            if (type == BLOCK) {
+                currentHardness[index] = hardnessInput[i];
+                currentResistance[index] = resistanceInput[i];
+            } else {
+                currentHardness[index] = 0.0f;
+                currentResistance[index] = 0.0f;
+            }
+        }
+
+        // Одна перестройка после всех изменений.
+        fill(
+                currentTypes,
+                currentHardness,
+                currentResistance
+        );
+    }
 }
