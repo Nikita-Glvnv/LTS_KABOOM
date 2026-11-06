@@ -5,6 +5,8 @@ import org.apache.logging.log4j.Logger;
 import com.kaboom.Kaboom;
 import com.kaboom.server.ChunkLoadingManager;
 import net.minecraft.util.math.ChunkPos;
+import com.kaboom.server.chunksnapshot;
+import java.util.concurrent.ArrayBlockingQueue;
 
 import net.minecraft.util.math.BlockPos;
 
@@ -66,6 +68,12 @@ public class DimensionWorker {
                         TEST_RETENTION_MS
                 );
 
+                if (Kaboom.getChunkSnapshot() != null) {
+                    Kaboom.getChunkSnapshot().requestTracking(
+                            dimensionId, cx, cz
+                    );
+                }
+
                 count++;
             }
         }
@@ -83,4 +91,14 @@ public class DimensionWorker {
         requestTestChunks(pos);
 
     }
+
+    private final ArrayBlockingQueue<chunksnapshot.SectionSnapshot>
+            incomingSections = new ArrayBlockingQueue<>(128);
+
+    public boolean offerSectionSnapshot(
+            chunksnapshot.SectionSnapshot snapshot
+    ) {
+        return incomingSections.offer(snapshot);
+    }
+
 }

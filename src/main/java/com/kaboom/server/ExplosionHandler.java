@@ -7,6 +7,7 @@ import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.world.WorldEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+import com.kaboom.server.chunksnapshot;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -70,5 +71,15 @@ public class ExplosionHandler {
                     "No DimensionWorker for dimension " + dimensionId
             );
         }
+    }
+
+    public boolean offerSectionSnapshot(
+            chunksnapshot.SectionSnapshot snapshot
+    ) {
+        DimensionWorker worker =
+                dimensionWorkers.get(snapshot.dimensionId);
+
+        return worker != null
+                && worker.offerSectionSnapshot(snapshot);
     }
 }

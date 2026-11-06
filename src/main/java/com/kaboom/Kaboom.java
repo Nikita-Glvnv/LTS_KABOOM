@@ -64,7 +64,10 @@ public class Kaboom
         explosionHandler.start();
         chunkLoadingManager = new ChunkLoadingManager();
         MinecraftForge.EVENT_BUS.register(chunkLoadingManager);
-        chunkSnapshot = new chunksnapshot();
+        chunkSnapshot = new chunksnapshot(
+                snapshot -> explosionHandler != null
+                        && explosionHandler.offerSectionSnapshot(snapshot)
+        );
         MinecraftForge.EVENT_BUS.register(chunkSnapshot);
     }
     @Mod.EventHandler
@@ -78,6 +81,12 @@ public class Kaboom
 
             chunkLoadingManager.stop();
             chunkLoadingManager = null;
+        }
+
+        if (chunkSnapshot != null) {
+            MinecraftForge.EVENT_BUS.unregister(chunkSnapshot);
+            chunkSnapshot.stop();
+            chunkSnapshot = null;
         }
     }
 
