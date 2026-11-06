@@ -80,6 +80,7 @@ public class ExplosionHandler {
                 dimensionWorkers.get(snapshot.dimensionId);
 
         return worker != null
-                && worker.offerSectionSnapshot(snapshot);
+                && worker.getSnapshotManager()
+                .offerSectionSnapshot(snapshot);
     }
 }
