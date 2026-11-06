@@ -10,6 +10,7 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.Mod.EventHandler;
 import net.minecraftforge.fml.common.event.*;
 import org.apache.logging.log4j.Logger;
+import com.kaboom.server.chunksnapshot;
 
 @Mod(modid = Kaboom.MODID, name = Kaboom.NAME, version = Kaboom.VERSION)
 public class Kaboom
@@ -63,6 +64,8 @@ public class Kaboom
         explosionHandler.start();
         chunkLoadingManager = new ChunkLoadingManager();
         MinecraftForge.EVENT_BUS.register(chunkLoadingManager);
+        chunkSnapshot = new chunksnapshot();
+        MinecraftForge.EVENT_BUS.register(chunkSnapshot);
     }
     @Mod.EventHandler
     public void onServerStopping(FMLServerStoppingEvent event) {
@@ -76,6 +79,11 @@ public class Kaboom
             chunkLoadingManager.stop();
             chunkLoadingManager = null;
         }
+    }
+
+    private static chunksnapshot chunkSnapshot;
+    public static chunksnapshot getChunkSnapshot() {
+        return chunkSnapshot;
     }
 
     @Mod.Instance(Kaboom.MODID)
