@@ -94,4 +94,51 @@ public class SnapshotManager {
         chunk.sections[snapshot.sectionY] = section;
         chunk.readyMask |= 1 << snapshot.sectionY;
     }
+
+    public boolean getBlock(
+            int x, int y, int z,
+            oktoderevo.BlockResult result
+    ) {
+        Objects.requireNonNull(result, "result");
+
+        // Проверяем допустимую высоту мира.
+        if (y < 0 || y >= 256) {
+            return false;
+        }
+
+        // Координаты чанка и вертикальной секции.
+        int chunkX = x >> 4;
+        int chunkZ = z >> 4;
+        int sectionY = y >> 4;
+
+        // Находим чанк в хранилище.
+        StoredChunk chunk = chunks.get(
+                ChunkPos.asLong(chunkX, chunkZ)
+        );
+
+        if (chunk == null) {
+            return false;
+        }
+
+        // Проверяем готовность секции.
+        if ((chunk.readyMask & (1 << sectionY)) == 0) {
+            return false;
+        }
+
+        oktoderevo section = chunk.sections[sectionY];
+
+        if (section == null) {
+            return false;
+        }
+
+        // Читаем блок по локальным координатам секции.
+        section.getBlock(
+                x & 15,
+                y & 15,
+                z & 15,
+                result
+        );
+
+        return true;
+    }
 }

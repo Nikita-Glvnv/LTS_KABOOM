@@ -91,5 +91,9 @@ public class DimensionWorker {
         requestTestChunks(pos);
 
     }
+    public SnapshotManager getSnapshotManager() {
+        return snapshotManager;
+    }
+
     //snapshotManager.processIncomingSnapshots(4);
 }
