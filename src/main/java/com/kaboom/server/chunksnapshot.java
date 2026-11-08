@@ -79,7 +79,40 @@ public class chunksnapshot {
         }
     }
 
-    public static final class SectionSnapshot {
+    public static final class SectionChanges implements SnapshotUpdate {
+        public final int dimensionId;
+        public final int chunkX, chunkZ, sectionY;
+
+        public final short[] positions;
+        public final byte[] types;
+        public final float[] hardness;
+        public final float[] resistance;
+        public final int count;
+
+        public SectionChanges(
+                int dimensionId, int chunkX, int chunkZ, int sectionY,
+                short[] positions, byte[] types,
+                float[] hardness, float[] resistance,
+                int count
+        ) {
+            this.dimensionId = dimensionId;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+            this.sectionY = sectionY;
+            this.positions = positions;
+            this.types = types;
+            this.hardness = hardness;
+            this.resistance = resistance;
+            this.count = count;
+        }
+
+        @Override
+        public int getDimensionId() {
+            return dimensionId;
+        }
+    }
+
+    public static final class SectionSnapshot implements SnapshotUpdate { {
         public final int dimensionId;
         public final int chunkX;
         public final int chunkZ;
@@ -108,9 +141,14 @@ public class chunksnapshot {
         }
     }
 
+        @Override
+        public int getDimensionId() {
+            return dimensionId;
+        }
+
     @FunctionalInterface
     public interface SnapshotReceiver {
-        boolean offer(SectionSnapshot snapshot);
+        boolean offer(SnapshotUpdate update);
     }
 
     private final SnapshotReceiver receiver;
@@ -421,6 +459,7 @@ public class chunksnapshot {
 
         processRequests();
         processInitialSections();
+        updateController.processDirtySections();
     }
 
     @SubscribeEvent
@@ -440,6 +479,7 @@ public class chunksnapshot {
         for (WorldServer world : DimensionManager.getWorlds()) {
             updateController.unregisterWorld(world);
         }
+        updateController.stop();
         incomingRequests.clear();
         pendingInitial.clear();
         trackedChunks.clear();
@@ -457,5 +497,18 @@ public class chunksnapshot {
         );
 
         return tracked == null ? null : tracked.updates;
+    }
+
+    public interface SnapshotUpdate {
+        int getDimensionId();
+    }
+
+    boolean isChunkInitialized(int dimensionId, int chunkX, int chunkZ) {
+        TrackedChunk tracked = getTrackedChunk(dimensionId, chunkX, chunkZ);
+        return tracked != null && tracked.initialized;
+    }
+
+    boolean offerUpdate(SnapshotUpdate update) {
+        return receiver.offer(update);
     }
 }
