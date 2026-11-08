@@ -20,7 +20,11 @@ public class ExplosionHandler {
     private void registerDimension(int dimensionId) {
         dimensionWorkers.computeIfAbsent(
                 dimensionId,
-                DimensionWorker::new
+                id -> {
+                    DimensionWorker worker = new DimensionWorker(id);
+                    worker.start();
+                    return worker;
+                }
         );
     }
 
@@ -51,11 +55,18 @@ public class ExplosionHandler {
 
         int dimensionId = event.getWorld().provider.getDimension();
 
-        dimensionWorkers.remove(dimensionId);
+        DimensionWorker worker = dimensionWorkers.remove(dimensionId);
+
+        if (worker != null) {
+            worker.stop();
+        }
     }
 
     public void stop() {
         MinecraftForge.EVENT_BUS.unregister(this);
+        for (DimensionWorker worker : dimensionWorkers.values()) {
+            worker.stop();
+        }
         dimensionWorkers.clear();
     }
 
