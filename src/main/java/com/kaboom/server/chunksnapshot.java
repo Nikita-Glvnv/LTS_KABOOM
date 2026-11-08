@@ -221,20 +221,16 @@ public class chunksnapshot {
             return;
         }
 
-        dimensionChunks.remove(
-                ChunkPos.asLong(chunkX, chunkZ)
-        );
-
-        if (dimensionChunks.isEmpty()) {
-            trackedChunks.remove(dimensionId);
-        }
-
         TrackedChunk removed = dimensionChunks.remove(
                 ChunkPos.asLong(chunkX, chunkZ)
         );
 
         if (removed != null) {
             updateController.onChunkUntracked(removed.updates);
+        }
+
+        if (dimensionChunks.isEmpty()) {
+            trackedChunks.remove(dimensionId);
         }
     }
 
