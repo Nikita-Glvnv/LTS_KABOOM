@@ -456,6 +456,6 @@ public class chunksnapshot {
                 chunkZ
         );
 
-        return tracked == null ? null : tracked.updateState;
+        return tracked == null ? null : tracked.updates;
     }
 }
