@@ -26,6 +26,9 @@ public class ChunkUpdateConroller implements IWorldEventListener{
         final BitSet[] dirtySections = new BitSet[16];
         final long[] sectionRevisions = new long[16];
         int nextScanSection = 0;
+
+        final long[] sectionHashes = new long[16];
+        final boolean[] sectionHashReady = new boolean[16];
     }
 
     private final chunksnapshot owner;
@@ -238,7 +241,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                     queueFull = true;
                     break;
                 }
-
+                onFullSectionChangesSent(state, changes);
                 // Очищаем только после успешного принятия.
                 dirty.clear();
                 budget--;
@@ -265,8 +268,197 @@ public class ChunkUpdateConroller implements IWorldEventListener{
         }
     }
 
+    private static final long HASH_OFFSET = 0xcbf29ce484222325L;
+    private static final long HASH_PRIME = 0x100000001b3L;
+
+    private static long calculateSectionHash(
+            byte[] types,
+            float[] hardness,
+            float[] resistance
+    ) {
+        long hash = HASH_OFFSET;
+
+        for (int i = 0; i < 4096; i++) {
+            hash = (hash ^ (types[i] & 0xFFL)) * HASH_PRIME;
+
+            hash = (hash ^
+                    (Float.floatToIntBits(hardness[i]) & 0xFFFFFFFFL))
+                    * HASH_PRIME;
+
+            hash = (hash ^
+                    (Float.floatToIntBits(resistance[i]) & 0xFFFFFFFFL))
+                    * HASH_PRIME;
+        }
+
+        return hash;
+    }
+
+    void onInitialSectionSent(
+            ChunkState state,
+            chunksnapshot.SectionSnapshot snapshot
+    ) {
+        int sectionY = snapshot.sectionY;
+
+        state.sectionHashes[sectionY] = calculateSectionHash(
+                snapshot.types,
+                snapshot.hardness,
+                snapshot.resistance
+        );
+
+        state.sectionHashReady[sectionY] = true;
+    }
+
+    private static final int MAX_SCAN_SECTIONS_PER_TICK = 1;
+    private static final int MAX_SCAN_CHECKS_PER_TICK = 64;
+
+    private final Deque<DirtyChunk> pendingScan = new ArrayDeque<>();
+
+    void onChunkTracked(
+            int dimensionId,
+            int chunkX,
+            int chunkZ,
+            ChunkState state
+    ) {
+        pendingScan.addLast(
+                new DirtyChunk(dimensionId, chunkX, chunkZ, state)
+        );
+    }
+
+    void onChunkUntracked(ChunkState state) {
+        pendingScan.removeIf(request -> request.state == state);
+        pendingDirty.removeIf(request -> request.state == state);
+    }
+
+    void onDimensionUntracked(int dimensionId) {
+        pendingScan.removeIf(request -> request.dimensionId == dimensionId);
+        pendingDirty.removeIf(request -> request.dimensionId == dimensionId);
+    }
+
+    private void markSectionDirty(
+            DirtyChunk request,
+            int sectionY
+    ) {
+        ChunkState state = request.state;
+
+        BitSet dirty = state.dirtySections[sectionY];
+
+        if (dirty == null) {
+            dirty = new BitSet(4096);
+            state.dirtySections[sectionY] = dirty;
+        }
+
+        dirty.set(0, 4096);
+
+        if (!state.queued) {
+            state.queued = true;
+            pendingDirty.addLast(request);
+        }
+    }
+
+    void scanSections() {
+        int budget = MAX_SCAN_SECTIONS_PER_TICK;
+        int checks = Math.min(
+                pendingScan.size(),
+                MAX_SCAN_CHECKS_PER_TICK
+        );
+
+        while (budget > 0 && checks-- > 0) {
+            DirtyChunk request = pendingScan.pollFirst();
+
+            ChunkState state = owner.getUpdateState(
+                    request.dimensionId,
+                    request.chunkX,
+                    request.chunkZ
+            );
+
+            // Отбрасываем записи удалённых чанков.
+            if (state != request.state) {
+                continue;
+            }
+
+            // Сохраняем циклический порядок обхода.
+            pendingScan.addLast(request);
+
+            // До первичной отправки сканирование не требуется.
+            if (!owner.isChunkInitialized(
+                    request.dimensionId,
+                    request.chunkX,
+                    request.chunkZ
+            )) {
+                continue;
+            }
+
+            WorldServer world = DimensionManager.getWorld(
+                    request.dimensionId, false
+            );
+
+            Chunk chunk = world == null ? null
+                    : world.getChunkProvider().getLoadedChunk(
+                    request.chunkX,
+                    request.chunkZ
+            );
+
+            if (chunk == null) {
+                continue;
+            }
+
+            int sectionY = state.nextScanSection;
+            state.nextScanSection = (sectionY + 1) & 15;
+
+            BitSet dirty = state.dirtySections[sectionY];
+
+            // Не проверяем секцию с ещё не отправленными изменениями.
+            if (dirty != null && !dirty.isEmpty()) {
+                budget--;
+                continue;
+            }
+
+            chunksnapshot.SectionSnapshot snapshot =
+                    owner.captureSection(
+                            world,
+                            chunk,
+                            request.dimensionId,
+                            sectionY
+                    );
+
+            long currentHash = calculateSectionHash(
+                    snapshot.types,
+                    snapshot.hardness,
+                    snapshot.resistance
+            );
+
+            if (!state.sectionHashReady[sectionY]
+                    || state.sectionHashes[sectionY] != currentHash) {
+
+                markSectionDirty(request, sectionY);
+            }
+
+            budget--;
+        }
+    }
+
+    private void onFullSectionChangesSent(
+            ChunkState state,
+            chunksnapshot.SectionChanges changes
+    ) {
+        if (changes.count != 4096) {
+            return;
+        }
+
+        int sectionY = changes.sectionY;
+
+        state.sectionHashes[sectionY] = calculateSectionHash(
+                changes.types,
+                changes.hardness,
+                changes.resistance
+        );
+
+        state.sectionHashReady[sectionY] = true;
+    }
+
     void stop() {
         pendingDirty.clear();
+        pendingScan.clear();
     }
 
     @Override

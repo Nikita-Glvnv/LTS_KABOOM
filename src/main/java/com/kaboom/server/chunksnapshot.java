@@ -184,6 +184,9 @@ public class chunksnapshot {
                             );
 
                     pendingInitial.addLast(tracked);
+                    updateController.onChunkTracked(
+                            dimensionId, chunkX, chunkZ, tracked.updates
+                    );
                     return tracked;
                 }
         );
@@ -225,6 +228,14 @@ public class chunksnapshot {
         if (dimensionChunks.isEmpty()) {
             trackedChunks.remove(dimensionId);
         }
+
+        TrackedChunk removed = dimensionChunks.remove(
+                ChunkPos.asLong(chunkX, chunkZ)
+        );
+
+        if (removed != null) {
+            updateController.onChunkUntracked(removed.updates);
+        }
     }
 
     private void unregisterDimension(int dimensionId) {
@@ -237,6 +248,7 @@ public class chunksnapshot {
         incomingRequests.removeIf(
                 request -> request.dimensionId == dimensionId
         );
+        updateController.onDimensionUntracked(dimensionId);
     }
 
     public void requestTracking(
@@ -302,7 +314,7 @@ public class chunksnapshot {
     }
 
     @SuppressWarnings("deprecation")
-    private SectionSnapshot captureSection(
+    SectionSnapshot captureSection(
             WorldServer world,
             Chunk chunk,
             int dimensionId,
@@ -430,6 +442,11 @@ public class chunksnapshot {
                 break;
             }
 
+            updateController.onInitialSectionSent(
+                    tracked.updates,
+                    snapshot
+            );
+
             tracked.nextInitialSection++;
             budget--;
             unavailable = 0;
@@ -456,10 +473,10 @@ public class chunksnapshot {
         if (event.phase != TickEvent.Phase.END) {
             return;
         }
-
         processRequests();
         processInitialSections();
         updateController.processDirtySections();
+        updateController.scanSections();
     }
 
     @SubscribeEvent
