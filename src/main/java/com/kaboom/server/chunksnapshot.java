@@ -112,7 +112,7 @@ public class chunksnapshot {
         }
     }
 
-    public static final class SectionSnapshot implements SnapshotUpdate { {
+    public static final class SectionSnapshot implements SnapshotUpdate {
         public final int dimensionId;
         public final int chunkX;
         public final int chunkZ;
@@ -139,13 +139,13 @@ public class chunksnapshot {
             this.hardness = hardness;
             this.resistance = resistance;
         }
-    }
+
 
         @Override
         public int getDimensionId() {
             return dimensionId;
         }
-
+    }
     @FunctionalInterface
     public interface SnapshotReceiver {
         boolean offer(SnapshotUpdate update);

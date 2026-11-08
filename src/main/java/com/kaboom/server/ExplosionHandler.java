@@ -73,14 +73,18 @@ public class ExplosionHandler {
         }
     }
 
-    public boolean offerSectionSnapshot(
-            chunksnapshot.SectionSnapshot snapshot
+    public boolean offerSnapshotUpdate(
+            chunksnapshot.SnapshotUpdate update
     ) {
+        if (update == null) {
+            return false;
+        }
+
         DimensionWorker worker =
-                dimensionWorkers.get(snapshot.dimensionId);
+                dimensionWorkers.get(update.getDimensionId());
 
         return worker != null
                 && worker.getSnapshotManager()
-                .offerSectionSnapshot(snapshot);
+                .offerSnapshotUpdate(update);
     }
 }

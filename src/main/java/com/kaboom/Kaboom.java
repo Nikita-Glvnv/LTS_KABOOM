@@ -66,7 +66,7 @@ public class Kaboom
         MinecraftForge.EVENT_BUS.register(chunkLoadingManager);
         chunkSnapshot = new chunksnapshot(
                 snapshot -> explosionHandler != null
-                        && explosionHandler.offerSectionSnapshot(snapshot)
+                        && explosionHandler.offerSnapshotUpdate(snapshot)
         );
         MinecraftForge.EVENT_BUS.register(chunkSnapshot);
     }

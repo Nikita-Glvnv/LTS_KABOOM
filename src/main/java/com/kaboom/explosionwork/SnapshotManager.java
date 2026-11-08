@@ -28,17 +28,41 @@ public class SnapshotManager {
 
     private static final int QUEUE_CAPACITY = 128;
 
-    private final ArrayBlockingQueue<chunksnapshot.SectionSnapshot>
+    private final ArrayBlockingQueue<chunksnapshot.SnapshotUpdate>
             incomingSections = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
-    public boolean offerSectionSnapshot(
-            chunksnapshot.SectionSnapshot snapshot
-    ) {
-        if (snapshot == null || snapshot.dimensionId != dimensionId) {
-            return false;
+    public boolean offerSnapshotUpdate(chunksnapshot.SnapshotUpdate update) {
+        return update != null
+                && update.getDimensionId() == dimensionId
+                && incomingSections.offer(update);
+    }
+
+    public void acceptSectionChanges(chunksnapshot.SectionChanges changes) {
+        if (changes.dimensionId != dimensionId) {
+            throw new IllegalArgumentException("Wrong dimension");
         }
 
-        return incomingSections.offer(snapshot);
+        if (changes.sectionY < 0 || changes.sectionY >= 16) {
+            throw new IllegalArgumentException("Invalid section Y");
+        }
+
+        StoredChunk chunk = chunks.get(
+                ChunkPos.asLong(changes.chunkX, changes.chunkZ)
+        );
+
+        if (chunk == null
+                || (chunk.readyMask & (1 << changes.sectionY)) == 0
+                || chunk.sections[changes.sectionY] == null) {
+            throw new IllegalStateException("Section is not initialized");
+        }
+
+        chunk.sections[changes.sectionY].applyChanges(
+                changes.positions,
+                changes.types,
+                changes.hardness,
+                changes.resistance,
+                changes.count
+        );
     }
 
     public int processIncomingSnapshots(int maxSnapshots) {
@@ -47,14 +71,19 @@ public class SnapshotManager {
 
         while (processed < maxSnapshots) {
 
-            chunksnapshot.SectionSnapshot snapshot =
-                    incomingSections.poll();
+            chunksnapshot.SnapshotUpdate update = incomingSections.poll();
 
-            if (snapshot == null) {
+            if (update == null) {
                 break;
             }
 
-            acceptFullSnapshot(snapshot);
+            if (update instanceof chunksnapshot.SectionSnapshot) {
+                acceptFullSnapshot((chunksnapshot.SectionSnapshot) update);
+            } else if (update instanceof chunksnapshot.SectionChanges) {
+                acceptSectionChanges((chunksnapshot.SectionChanges) update);
+            } else {
+                throw new IllegalArgumentException("Unknown snapshot update");
+            }
 
             processed++;
         }
