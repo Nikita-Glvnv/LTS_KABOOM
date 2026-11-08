@@ -25,6 +25,9 @@ public class chunksnapshot {
     private static final byte[] AIR_TYPES = new byte[4096];
     private static final float[] ZERO_VALUES = new float[4096];
 
+    private final ChunkUpdateConroller updateController =
+            new ChunkUpdateConroller(this);
+
     private final Map<Integer, Map<Long, TrackedChunk>> trackedChunks =
             new HashMap<>();
 
@@ -63,11 +66,10 @@ public class chunksnapshot {
         final int chunkX;
         final int chunkZ;
 
-        final BitSet[] dirtySections = new BitSet[16];
-        final long[] sectionRevisions = new long[16];
+        final ChunkUpdateConroller.ChunkState updates =
+                new ChunkUpdateConroller.ChunkState();
 
         int nextInitialSection = 0;
-        int nextScanSection = 0;
         boolean initialized = false;
 
         TrackedChunk(int dimensionId, int chunkX, int chunkZ) {
@@ -115,6 +117,9 @@ public class chunksnapshot {
 
     public chunksnapshot(SnapshotReceiver receiver) {
         this.receiver = Objects.requireNonNull(receiver);
+        for (WorldServer world : DimensionManager.getWorlds()) {
+            updateController.registerWorld(world);
+        }
     }
 
     private TrackedChunk registerChunk(
@@ -400,6 +405,15 @@ public class chunksnapshot {
     }
 
     @SubscribeEvent
+    public void onWorldLoad(WorldEvent.Load event) {
+        if (event.getWorld() instanceof WorldServer) {
+            updateController.registerWorld(
+                    (WorldServer) event.getWorld()
+            );
+        }
+    }
+
+    @SubscribeEvent
     public void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.END) {
             return;
@@ -414,17 +428,34 @@ public class chunksnapshot {
         if (!(event.getWorld() instanceof WorldServer)) {
             return;
         }
-
+        updateController.unregisterWorld(
+                (WorldServer) event.getWorld()
+        );
         unregisterDimension(
                 event.getWorld().provider.getDimension()
         );
     }
 
     public void stop() {
+        for (WorldServer world : DimensionManager.getWorlds()) {
+            updateController.unregisterWorld(world);
+        }
         incomingRequests.clear();
         pendingInitial.clear();
         trackedChunks.clear();
     }
 
+    ChunkUpdateConroller.ChunkState getUpdateState(
+            int dimensionId,
+            int chunkX,
+            int chunkZ
+    ) {
+        TrackedChunk tracked = getTrackedChunk(
+                dimensionId,
+                chunkX,
+                chunkZ
+        );
 
+        return tracked == null ? null : tracked.updateState;
+    }
 }
