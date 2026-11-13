@@ -1,7 +1,6 @@
 package com.kaboom.explosionwork;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import static com.kaboom.ModLogger.LOGGER;
 import java.util.concurrent.locks.LockSupport;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -119,10 +118,7 @@ public class DimensionWorker {
                 "LTS_KABOOM-Dimension-" + dimensionId
         );
     }
-    private static final Logger LOGGER =
-            LogManager.getLogger("LTS_KABOOM");
-
-
+    
     public void submitExplosion(BlockPos pos, int power) {
 
         BlockPos capturedPos = new BlockPos(

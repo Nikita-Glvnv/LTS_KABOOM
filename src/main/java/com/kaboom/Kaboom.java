@@ -9,7 +9,7 @@ import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.Mod.EventHandler;
 import net.minecraftforge.fml.common.event.*;
-import org.apache.logging.log4j.Logger;
+import static com.kaboom.ModLogger.LOGGER;
 import com.kaboom.server.chunksnapshot;
 
 @Mod(modid = Kaboom.MODID, name = Kaboom.NAME, version = Kaboom.VERSION)
@@ -18,7 +18,6 @@ public class Kaboom
     public static final String MODID = "lts_kaboom";
     public static final String NAME = "LTS_KABOOM";
     public static final String VERSION = "0.0";
-    private static Logger logger;
 
     private static ExplosionHandler explosionHandler;
     public static ExplosionHandler getExplosionHandler() {
@@ -42,14 +41,16 @@ public class Kaboom
                     }
                 }
         );
-        logger = event.getModLog();
+        ModLogger.initialize(
+                event.getModConfigurationDirectory().getParentFile()
+        );
     }
 
     @EventHandler
     public void init(FMLInitializationEvent event)
     {
         // some example code
-        logger.info("DIRT BLOCK >> {}", Blocks.DIRT.getRegistryName());
+        LOGGER.info("DIRT BLOCK >> {}", Blocks.DIRT.getRegistryName());
     }
 
     @Mod.EventHandler
