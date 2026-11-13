@@ -84,6 +84,17 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
         int sectionY = y >> 4;
 
+
+        if (!owner.isSectionInitialized(
+                world.provider.getDimension(),
+                x >> 4,
+                z >> 4,
+                sectionY
+        )) {
+            return;
+        }
+
+
         int index =
                 ((y & 15) << 8)
                         | ((z & 15) << 4)
@@ -218,17 +229,6 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                 continue;
             }
 
-            // Дожидаемся завершения первичной отправки.
-            if (!owner.isChunkInitialized(
-                    request.dimensionId,
-                    request.chunkX,
-                    request.chunkZ
-            )) {
-                metrics.dirtyDeferredInitial++;
-                pendingDirty.addLast(request);
-                continue;
-            }
-
             WorldServer world = DimensionManager.getWorld(
                     request.dimensionId, false
             );
@@ -256,6 +256,17 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                 if (dirty == null || dirty.isEmpty()) {
                     continue;
                 }
+
+                if (!owner.isSectionInitialized(
+                        request.dimensionId,
+                        request.chunkX,
+                        request.chunkZ,
+                        sectionY
+                )) {
+                    metrics.dirtyDeferredInitial++;
+                    continue;
+                }
+
 
                 chunksnapshot.SectionChanges changes =
                         createChanges(world, chunk, request, sectionY, dirty);
@@ -344,6 +355,15 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
         state.sectionHashReady[sectionY] = true;
         metrics.initialHashes++;
+
+// Первоначальный снимок уже содержит все изменения,
+// произошедшие до его создания.
+        BitSet dirty = state.dirtySections[sectionY];
+
+        if (dirty != null) {
+            dirty.clear();
+        }
+
     }
 
     private static final int MAX_SCAN_SECTIONS_PER_TICK = 1;
@@ -420,15 +440,31 @@ public class ChunkUpdateConroller implements IWorldEventListener{
             // Сохраняем циклический порядок обхода.
             pendingScan.addLast(request);
 
-            // До первичной отправки сканирование не требуется.
-            if (!owner.isChunkInitialized(
-                    request.dimensionId,
-                    request.chunkX,
-                    request.chunkZ
-            )) {
+
+// Ищем следующую инициализированную секцию.
+            int sectionY = -1;
+
+            for (int attempt = 0; attempt < 16; attempt++) {
+                int candidate = state.nextScanSection;
+                state.nextScanSection = (candidate + 1) & 15;
+
+                if (owner.isSectionInitialized(
+                        request.dimensionId,
+                        request.chunkX,
+                        request.chunkZ,
+                        candidate
+                )) {
+                    sectionY = candidate;
+                    break;
+                }
+            }
+
+// В чанке пока нет готовых секций.
+            if (sectionY == -1) {
                 metrics.scanDeferredInitial++;
                 continue;
             }
+
 
             WorldServer world = DimensionManager.getWorld(
                     request.dimensionId, false
@@ -444,9 +480,6 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                 metrics.scanDeferredUnloaded++;
                 continue;
             }
-
-            int sectionY = state.nextScanSection;
-            state.nextScanSection = (sectionY + 1) & 15;
 
             BitSet dirty = state.dirtySections[sectionY];
 
