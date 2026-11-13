@@ -10,16 +10,26 @@ import java.util.concurrent.ArrayBlockingQueue;
 import com.kaboom.Kaboom;
 import com.kaboom.server.ChunkLoadingManager;
 import java.util.concurrent.TimeUnit;
+import java.util.Iterator;
 
 public class SnapshotManager {
     private final int dimensionId;
     private static final long CHUNK_RETENTION_MS = 30_000L;
+    private static final long INACTIVITY_TIMEOUT_NANOS =
+            TimeUnit.SECONDS.toNanos(30);
+
+    private static final long SNAPSHOT_CLEANUP_DELAY_NANOS =
+            TimeUnit.SECONDS.toNanos(30);
 
     private static final long REQUEST_INTERVAL_NANOS =
             TimeUnit.SECONDS.toNanos(10);
 
     private final Map<Long, Long> lastTrackingRequests =
             new HashMap<>();
+
+    private final Map<Long, Long> lastBlockRequests = new HashMap<>();
+    private final Map<Long, Long> inactiveSince = new HashMap<>();
+    private final Map<Long, ChunkPos> chunkPositions = new HashMap<>();
 
     private static final class StoredChunk {
 
@@ -97,7 +107,7 @@ public class SnapshotManager {
 
             processed++;
         }
-
+        cleanupInactiveChunks();
         return processed;
     }
 
@@ -124,6 +134,11 @@ public class SnapshotManager {
                 snapshot.chunkX,
                 snapshot.chunkZ
         );
+
+        if (!lastBlockRequests.containsKey(key)
+                || inactiveSince.containsKey(key)) {
+            return;
+        }
 
         StoredChunk chunk = chunks.computeIfAbsent(
                 key,
@@ -202,7 +217,18 @@ public class SnapshotManager {
                 && chunk.sections[sectionY] != null;
 
         long now = System.nanoTime();
+        lastBlockRequests.put(key, now);
+        inactiveSince.remove(key);
+        chunkPositions.putIfAbsent(key, new ChunkPos(chunkX, chunkZ));
         Long lastRequest = lastTrackingRequests.get(key);
+
+        lastBlockRequests.put(key, now);
+        inactiveSince.remove(key);
+
+        chunkPositions.computeIfAbsent(
+                key,
+                k -> new ChunkPos(chunkX, chunkZ)
+        );
 
         if (lastRequest == null
                 || now - lastRequest >= REQUEST_INTERVAL_NANOS) {
@@ -232,5 +258,52 @@ public class SnapshotManager {
         }
 
         return ready;
+    }
+
+    private void cleanupInactiveChunks() {
+        long now = System.nanoTime();
+
+        Iterator<Map.Entry<Long, Long>> iterator =
+                lastBlockRequests.entrySet().iterator();
+
+        chunksnapshot snapshotService = Kaboom.getChunkSnapshot();
+
+        while (iterator.hasNext()) {
+            Map.Entry<Long, Long> entry = iterator.next();
+            long key = entry.getKey();
+
+            Long inactiveAt = inactiveSince.get(key);
+
+            // Первый этап: прекращаем отслеживание.
+            if (inactiveAt == null) {
+                if (now - entry.getValue() < INACTIVITY_TIMEOUT_NANOS) {
+                    continue;
+                }
+
+                ChunkPos pos = chunkPositions.get(key);
+
+                if (pos != null && snapshotService != null) {
+                    snapshotService.releaseTracking(
+                            dimensionId,
+                            pos.x,
+                            pos.z
+                    );
+                }
+
+                inactiveSince.put(key, now);
+                continue;
+            }
+
+            // Второй этап: удаляем снимок после дополнительного ожидания.
+            if (now - inactiveAt < SNAPSHOT_CLEANUP_DELAY_NANOS) {
+                continue;
+            }
+
+            chunks.remove(key);
+            lastTrackingRequests.remove(key);
+            inactiveSince.remove(key);
+            chunkPositions.remove(key);
+            iterator.remove();
+        }
     }
 }
