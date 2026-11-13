@@ -67,6 +67,13 @@ public class SnapshotManager {
 
     private final Map<Long, Long> lastTrackingRequests =
             new HashMap<>();
+    private static final class SectionRequestState {
+        int requestedMask = 0;
+        final long[] lastRequestNanos = new long[16];
+    }
+
+    private final Map<Long, SectionRequestState> sectionRequests =
+            new HashMap<>();
 
     private final Map<Long, Long> lastBlockRequests = new HashMap<>();
     private final Map<Long, Long> inactiveSince = new HashMap<>();
@@ -132,6 +139,27 @@ public class SnapshotManager {
                     dimensionId, changes.chunkX, changes.chunkZ, changes.sectionY
             );
             throw new IllegalArgumentException("Invalid section Y");
+        }
+
+        long key = ChunkPos.asLong(
+                changes.chunkX,
+                changes.chunkZ
+        );
+
+        SectionRequestState requestState = sectionRequests.get(key);
+        int sectionBit = 1 << changes.sectionY;
+
+        if (inactiveSince.containsKey(key)
+                || requestState == null
+                || (requestState.requestedMask & sectionBit) == 0) {
+
+            LOGGER.debug(
+                    "SnapshotManager delta discarded for untracked section: dimension={}, chunk=({}, {}), section={}",
+                    dimensionId, changes.chunkX,
+                    changes.chunkZ, changes.sectionY
+            );
+
+            return;
         }
 
         StoredChunk chunk = chunks.get(
@@ -233,6 +261,30 @@ public class SnapshotManager {
             throw new IllegalArgumentException("Invalid section Y");
         }
 
+        long key = ChunkPos.asLong(
+                snapshot.chunkX,
+                snapshot.chunkZ
+        );
+        SectionRequestState requestState = sectionRequests.get(key);
+        int sectionBit = 1 << snapshot.sectionY;
+
+        if (!lastBlockRequests.containsKey(key)
+                || inactiveSince.containsKey(key)
+                || requestState == null
+                || (requestState.requestedMask & sectionBit) == 0) {
+
+            metrics.fullDiscarded++;
+
+            LOGGER.debug(
+                    "SnapshotManager unrequested section discarded: dimension={}, chunk=({}, {}), section={}",
+                    dimensionId, snapshot.chunkX,
+                    snapshot.chunkZ, snapshot.sectionY
+            );
+
+            return;
+        }
+
+// Создаём октодерево только для действительно нужной секции.
         oktoderevo section = new oktoderevo();
 
         section.fill(
@@ -240,22 +292,6 @@ public class SnapshotManager {
                 snapshot.hardness,
                 snapshot.resistance
         );
-
-        long key = ChunkPos.asLong(
-                snapshot.chunkX,
-                snapshot.chunkZ
-        );
-
-        if (!lastBlockRequests.containsKey(key)
-                || inactiveSince.containsKey(key)) {
-            metrics.fullDiscarded++;
-            LOGGER.debug(
-                    "SnapshotManager full snapshot discarded: dimension={}, chunk=({}, {}), section={}, reason={}",
-                    dimensionId, snapshot.chunkX, snapshot.chunkZ, snapshot.sectionY,
-                    inactiveSince.containsKey(key) ? "inactive" : "not_requested"
-            );
-            return;
-        }
 
         boolean newChunk = !chunks.containsKey(key);
         StoredChunk chunk = chunks.computeIfAbsent(
@@ -303,12 +339,20 @@ public class SnapshotManager {
     ) {
         Objects.requireNonNull(result, "result");
         metrics.blockReads++;
-        if (!ensureSectionTracked(x, y, z)) {
+        if (y < 0 || y >= 256) {
             metrics.invalidHeights++;
             return false;
         }
-        // Проверяем допустимую высоту мира.
-        if (y < 0 || y >= 256) {
+
+        if (!ensureSectionTracked(x, y, z)) {
+            long key = ChunkPos.asLong(x >> 4, z >> 4);
+
+            if (chunks.containsKey(key)) {
+                metrics.missingSections++;
+            } else {
+                metrics.missingChunks++;
+            }
+
             return false;
         }
 
@@ -353,8 +397,8 @@ public class SnapshotManager {
     }
 
     public boolean ensureSectionTracked(int x, int y, int z) {
-
         metrics.trackingChecks++;
+
         if (y < 0 || y >= 256) {
             return false;
         }
@@ -364,76 +408,114 @@ public class SnapshotManager {
         int sectionY = y >> 4;
 
         long key = ChunkPos.asLong(chunkX, chunkZ);
-
-        StoredChunk chunk = chunks.get(key);
-
-        boolean ready = chunk != null
-                && (chunk.readyMask & (1 << sectionY)) != 0
-                && chunk.sections[sectionY] != null;
-
         long now = System.nanoTime();
-        Long inactiveAt = inactiveSince.get(key);
+
+        // Повторная активация чанка.
+        Long inactiveAt = inactiveSince.remove(key);
+
         if (inactiveAt != null) {
+            StoredChunk old = chunks.remove(key);
+
+            sectionRequests.remove(key);
+            lastTrackingRequests.remove(key);
+
             metrics.reactivations++;
+
             LOGGER.warn(
-                    "SnapshotManager inactive chunk reactivated: dimension={}, chunk=({}, {}), inactiveMs={}, cachedReadyMask={}, snapshotMayBeStale=true",
+                    "SnapshotManager chunk reactivated: dimension={}, chunk=({}, {}), inactiveMs={}, oldReadyMask={}, cacheInvalidated=true",
                     dimensionId, chunkX, chunkZ,
                     TimeUnit.NANOSECONDS.toMillis(now - inactiveAt),
-                    chunk == null ? 0 : chunk.readyMask
+                    old == null ? 0 : old.readyMask
             );
         }
-        lastBlockRequests.put(key, now);
-        inactiveSince.remove(key);
-        chunkPositions.putIfAbsent(key, new ChunkPos(chunkX, chunkZ));
-        Long lastRequest = lastTrackingRequests.get(key);
 
         lastBlockRequests.put(key, now);
-        inactiveSince.remove(key);
 
         chunkPositions.computeIfAbsent(
                 key,
                 k -> new ChunkPos(chunkX, chunkZ)
         );
 
-        if (lastRequest == null
-                || now - lastRequest >= REQUEST_INTERVAL_NANOS) {
+        StoredChunk chunk = chunks.get(key);
+        int sectionBit = 1 << sectionY;
+
+        boolean ready = chunk != null
+                && (chunk.readyMask & sectionBit) != 0
+                && chunk.sections[sectionY] != null;
+
+        // Продлеваем загрузку чанка независимо от готовности секции.
+        Long lastChunkRequest = lastTrackingRequests.get(key);
+
+        if (lastChunkRequest == null
+                || now - lastChunkRequest >= REQUEST_INTERVAL_NANOS) {
 
             ChunkLoadingManager loadingManager =
                     Kaboom.getChunkLoadingManager();
 
-            chunksnapshot snapshotService =
-                    Kaboom.getChunkSnapshot();
-
-            if (loadingManager != null && snapshotService != null) {
-
+            if (loadingManager != null) {
                 loadingManager.requestChunk(
                         dimensionId,
                         new ChunkPos(chunkX, chunkZ),
                         CHUNK_RETENTION_MS
                 );
 
+                lastTrackingRequests.put(key, now);
+            } else {
+                metrics.trackingUnavailable++;
+            }
+        }
+
+        // Данные секции уже готовы — повторно не запрашиваем.
+        if (ready) {
+            return true;
+        }
+
+        SectionRequestState requestState =
+                sectionRequests.computeIfAbsent(
+                        key,
+                        k -> new SectionRequestState()
+                );
+
+        boolean firstRequest =
+                (requestState.requestedMask & sectionBit) == 0;
+
+        boolean retry =
+                !firstRequest
+                        && now - requestState.lastRequestNanos[sectionY]
+                        >= REQUEST_INTERVAL_NANOS;
+
+        if (firstRequest || retry) {
+            chunksnapshot snapshotService =
+                    Kaboom.getChunkSnapshot();
+
+            if (snapshotService != null) {
                 snapshotService.requestTracking(
                         dimensionId,
                         chunkX,
-                        chunkZ
+                        chunkZ,
+                        sectionY
                 );
 
-                lastTrackingRequests.put(key, now);
+                requestState.requestedMask |= sectionBit;
+                requestState.lastRequestNanos[sectionY] = now;
+
                 metrics.trackingRequests++;
-                if (lastRequest != null) {
+
+                if (retry) {
                     metrics.trackingRefreshes++;
                 }
+
                 LOGGER.debug(
-                        "SnapshotManager tracking requested: dimension={}, chunk=({}, {}), section={}, refresh={}",
-                        dimensionId, chunkX, chunkZ, sectionY,
-                        lastRequest != null
+                        "SnapshotManager section requested: dimension={}, chunk=({}, {}), section={}, retry={}, requestedMask={}",
+                        dimensionId, chunkX, chunkZ,
+                        sectionY, retry, requestState.requestedMask
                 );
             } else {
                 metrics.trackingUnavailable++;
             }
         }
 
-        return ready;
+        return false;
     }
 
     private void cleanupInactiveChunks() {
@@ -499,6 +581,7 @@ public class SnapshotManager {
             lastTrackingRequests.remove(key);
             inactiveSince.remove(key);
             chunkPositions.remove(key);
+            sectionRequests.remove(key);
             iterator.remove();
         }
     }

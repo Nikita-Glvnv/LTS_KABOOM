@@ -69,17 +69,20 @@ public class chunksnapshot {
         final int dimensionId;
         final int chunkX;
         final int chunkZ;
+        final int sectionY;
 
         TrackingRequest(
                 RequestType type,
                 int dimensionId,
                 int chunkX,
-                int chunkZ
+                int chunkZ,
+                int sectionY
         ) {
             this.type = type;
             this.dimensionId = dimensionId;
             this.chunkX = chunkX;
             this.chunkZ = chunkZ;
+            this.sectionY = sectionY;
         }
     }
 
@@ -91,8 +94,17 @@ public class chunksnapshot {
         final ChunkUpdateConroller.ChunkState updates =
                 new ChunkUpdateConroller.ChunkState();
 
-        int nextInitialSection = 0;
-        boolean initialized = false;
+        // Секции, отслеживание которых было запрошено.
+        int requestedMask = 0;
+
+        // Секции, ожидающие первоначальной или повторной отправки.
+        int pendingMask = 0;
+
+        // Секции, снимки которых успешно переданы.
+        int initializedMask = 0;
+
+        // Предотвращает повторное добавление чанка в очередь.
+        boolean queuedForInitial = false;
 
         TrackedChunk(int dimensionId, int chunkX, int chunkZ) {
             this.dimensionId = dimensionId;
@@ -187,7 +199,8 @@ public class chunksnapshot {
     private TrackedChunk registerChunk(
             int dimensionId,
             int chunkX,
-            int chunkZ
+            int chunkZ,
+            int sectionY
     ) {
         Map<Long, TrackedChunk> dimensionChunks =
                 trackedChunks.computeIfAbsent(
@@ -197,23 +210,39 @@ public class chunksnapshot {
 
         long key = ChunkPos.asLong(chunkX, chunkZ);
 
-        return dimensionChunks.computeIfAbsent(
-                key,
-                k -> {
-                    TrackedChunk tracked =
-                            new TrackedChunk(
-                                    dimensionId,
-                                    chunkX,
-                                    chunkZ
-                            );
+        TrackedChunk tracked = dimensionChunks.get(key);
 
-                    pendingInitial.addLast(tracked);
-                    updateController.onChunkTracked(
-                            dimensionId, chunkX, chunkZ, tracked.updates
-                    );
-                    return tracked;
-                }
-        );
+        if (tracked == null) {
+            tracked = new TrackedChunk(
+                    dimensionId,
+                    chunkX,
+                    chunkZ
+            );
+
+            dimensionChunks.put(key, tracked);
+
+            updateController.onChunkTracked(
+                    dimensionId,
+                    chunkX,
+                    chunkZ,
+                    tracked.updates
+            );
+        }
+
+        int bit = 1 << sectionY;
+
+        tracked.requestedMask |= bit;
+        tracked.pendingMask |= bit;
+
+        // Повторный запрос должен заново отправить секцию.
+        tracked.initializedMask &= ~bit;
+
+        if (!tracked.queuedForInitial) {
+            pendingInitial.addLast(tracked);
+            tracked.queuedForInitial = true;
+        }
+
+        return tracked;
     }
 
     private TrackedChunk getTrackedChunk(
@@ -253,8 +282,16 @@ public class chunksnapshot {
         if (removed != null) {
             metrics.stops++;
             updateController.onChunkUntracked(removed.updates);
-            LOGGER.info("Server snapshot tracking stopped: dimension={}, chunk=({}, {}), initialized={}, nextSection={}",
-                    dimensionId, chunkX, chunkZ, removed.initialized, removed.nextInitialSection);
+            pendingInitial.removeIf(
+                    tracked -> tracked == removed
+            );
+            LOGGER.info(
+                    "Server snapshot tracking stopped: dimension={}, chunk=({}, {}), requestedMask={}, initializedMask={}, pendingMask={}",
+                    dimensionId, chunkX, chunkZ,
+                    removed.requestedMask,
+                    removed.initializedMask,
+                    removed.pendingMask
+            );
         } else {
             metrics.missingStops++;
         }
@@ -285,17 +322,24 @@ public class chunksnapshot {
     public void requestTracking(
             int dimensionId,
             int chunkX,
-            int chunkZ
+            int chunkZ,
+            int sectionY
     ) {
+        if (sectionY < 0 || sectionY >= 16) {
+            throw new IllegalArgumentException(
+                    "Invalid sectionY: " + sectionY
+            );
+        }
+
         incomingRequests.offer(
                 new TrackingRequest(
                         RequestType.START,
                         dimensionId,
                         chunkX,
-                        chunkZ
+                        chunkZ,
+                        sectionY
                 )
         );
-        enqueuedStarts.incrementAndGet();
     }
 
     public void releaseTracking(
@@ -308,7 +352,8 @@ public class chunksnapshot {
                         RequestType.STOP,
                         dimensionId,
                         chunkX,
-                        chunkZ
+                        chunkZ,
+                        -1
                 )
         );
         enqueuedStops.incrementAndGet();
@@ -331,7 +376,12 @@ public class chunksnapshot {
                             request.dimensionId, false
                     ) != null) {
                         if (getTrackedChunk(request.dimensionId, request.chunkX, request.chunkZ) == null) {
-                            registerChunk(request.dimensionId, request.chunkX, request.chunkZ);
+                            registerChunk(
+                                    request.dimensionId,
+                                    request.chunkX,
+                                    request.chunkZ,
+                                    request.sectionY
+                            );
                             metrics.starts++;
                             LOGGER.info("Server snapshot tracking started: dimension={}, chunk=({}, {}), initialQueue={}",
                                     request.dimensionId, request.chunkX, request.chunkZ, pendingInitial.size());
@@ -449,18 +499,27 @@ public class chunksnapshot {
             }
 
             checks++;
-            metrics.initialChecks++;
 
             TrackedChunk tracked = pendingInitial.pollFirst();
+            tracked.queuedForInitial = false;
 
+            // Проверяем, что чанк ещё отслеживается.
             if (getTrackedChunk(
                     tracked.dimensionId,
                     tracked.chunkX,
                     tracked.chunkZ
             ) != tracked) {
-                metrics.initialStale++;
                 continue;
             }
+
+            if (tracked.pendingMask == 0) {
+                continue;
+            }
+
+            // Выбираем одну из запрошенных секций.
+            int sectionY = Integer.numberOfTrailingZeros(
+                    tracked.pendingMask
+            );
 
             WorldServer world = DimensionManager.getWorld(
                     tracked.dimensionId,
@@ -476,8 +535,8 @@ public class chunksnapshot {
 
             if (chunk == null) {
                 pendingInitial.addLast(tracked);
+                tracked.queuedForInitial = true;
                 unavailable++;
-                metrics.initialUnavailable++;
                 continue;
             }
 
@@ -485,14 +544,12 @@ public class chunksnapshot {
                     world,
                     chunk,
                     tracked.dimensionId,
-                    tracked.nextInitialSection
+                    sectionY
             );
 
             if (!receiver.offer(snapshot)) {
-                metrics.initialRejected++;
-                LOGGER.debug("Server initial section offer rejected: dimension={}, chunk=({}, {}), section={}",
-                        tracked.dimensionId, tracked.chunkX, tracked.chunkZ, tracked.nextInitialSection);
                 pendingInitial.addFirst(tracked);
+                tracked.queuedForInitial = true;
                 break;
             }
 
@@ -501,24 +558,19 @@ public class chunksnapshot {
                     snapshot
             );
 
-            metrics.initialSent++;
-            LOGGER.debug("Server initial section sent: dimension={}, chunk=({}, {}), section={}",
-                    tracked.dimensionId, tracked.chunkX, tracked.chunkZ, tracked.nextInitialSection);
-            tracked.nextInitialSection++;
+            int bit = 1 << sectionY;
+
+            tracked.pendingMask &= ~bit;
+            tracked.initializedMask |= bit;
+
             budget--;
             unavailable = 0;
 
-            if (tracked.nextInitialSection < 16) {
+            // Остались другие запрошенные секции.
+            if (tracked.pendingMask != 0) {
                 pendingInitial.addLast(tracked);
-            } else {
-                tracked.initialized = true;
-                metrics.initialComplete++;
-                LOGGER.info("Server initial chunk snapshot complete: dimension={}, chunk=({}, {})",
-                        tracked.dimensionId, tracked.chunkX, tracked.chunkZ);
+                tracked.queuedForInitial = true;
             }
-        }
-        if (budget == 0 && !pendingInitial.isEmpty()) {
-            metrics.initialLimitHits++;
         }
     }
 
@@ -661,9 +713,39 @@ public class chunksnapshot {
         int getDimensionId();
     }
 
-    boolean isChunkInitialized(int dimensionId, int chunkX, int chunkZ) {
-        TrackedChunk tracked = getTrackedChunk(dimensionId, chunkX, chunkZ);
-        return tracked != null && tracked.initialized;
+    boolean isSectionInitialized(
+            int dimensionId,
+            int chunkX,
+            int chunkZ,
+            int sectionY
+    ) {
+        if (sectionY < 0 || sectionY >= 16) {
+            return false;
+        }
+
+        TrackedChunk tracked = getTrackedChunk(
+                dimensionId,
+                chunkX,
+                chunkZ
+        );
+
+        return tracked != null
+                && (tracked.initializedMask & (1 << sectionY)) != 0;
+    }
+
+    boolean isChunkInitialized(
+            int dimensionId,
+            int chunkX,
+            int chunkZ
+    ) {
+        TrackedChunk tracked = getTrackedChunk(
+                dimensionId,
+                chunkX,
+                chunkZ
+        );
+
+        return tracked != null
+                && tracked.initializedMask == 0xFFFF;
     }
 
     boolean offerUpdate(SnapshotUpdate update) {
