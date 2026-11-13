@@ -340,6 +340,9 @@ public class chunksnapshot {
                         sectionY
                 )
         );
+
+        enqueuedStarts.incrementAndGet();
+
     }
 
     public void releaseTracking(
@@ -371,31 +374,79 @@ public class chunksnapshot {
             metrics.requests++;
 
             switch (request.type) {
+
                 case START:
                     if (DimensionManager.getWorld(
                             request.dimensionId, false
                     ) != null) {
-                        if (getTrackedChunk(request.dimensionId, request.chunkX, request.chunkZ) == null) {
-                            registerChunk(
+
+                        TrackedChunk existing = getTrackedChunk(
+                                request.dimensionId,
+                                request.chunkX,
+                                request.chunkZ
+                        );
+
+                        int bit = 1 << request.sectionY;
+
+                        boolean newChunk = existing == null;
+                        boolean newSection = newChunk
+                                || (existing.requestedMask & bit) == 0;
+
+                        // Регистрируем секцию независимо от того,
+                        // отслеживается чанк или нет.
+                        TrackedChunk tracked = registerChunk(
+                                request.dimensionId,
+                                request.chunkX,
+                                request.chunkZ,
+                                request.sectionY
+                        );
+
+                        if (newChunk) {
+                            metrics.starts++;
+
+                            LOGGER.info(
+                                    "Server snapshot tracking started: dimension={}, chunk=({}, {}), section={}",
                                     request.dimensionId,
                                     request.chunkX,
                                     request.chunkZ,
                                     request.sectionY
                             );
-                            metrics.starts++;
-                            LOGGER.info("Server snapshot tracking started: dimension={}, chunk=({}, {}), initialQueue={}",
-                                    request.dimensionId, request.chunkX, request.chunkZ, pendingInitial.size());
+
+                        } else if (newSection) {
+                            LOGGER.info(
+                                    "Server snapshot section added: dimension={}, chunk=({}, {}), section={}, requestedMask={}, pendingMask={}",
+                                    request.dimensionId,
+                                    request.chunkX,
+                                    request.chunkZ,
+                                    request.sectionY,
+                                    tracked.requestedMask,
+                                    tracked.pendingMask
+                            );
+
                         } else {
                             metrics.duplicateStarts++;
-                            LOGGER.debug("Server snapshot tracking already active: dimension={}, chunk=({}, {})",
-                                    request.dimensionId, request.chunkX, request.chunkZ);
+
+                            LOGGER.debug(
+                                    "Server snapshot section requested again: dimension={}, chunk=({}, {}), section={}",
+                                    request.dimensionId,
+                                    request.chunkX,
+                                    request.chunkZ,
+                                    request.sectionY
+                            );
                         }
+
                     } else {
                         metrics.missingWorld++;
-                        LOGGER.debug("Server snapshot tracking skipped: world unavailable, dimension={}, chunk=({}, {})",
-                                request.dimensionId, request.chunkX, request.chunkZ);
+
+                        LOGGER.debug(
+                                "Server snapshot tracking skipped: world unavailable, dimension={}, chunk=({}, {})",
+                                request.dimensionId,
+                                request.chunkX,
+                                request.chunkZ
+                        );
                     }
                     break;
+
 
                 case STOP:
                     unregisterChunk(
@@ -500,6 +551,9 @@ public class chunksnapshot {
 
             checks++;
 
+            metrics.initialChecks++;
+
+
             TrackedChunk tracked = pendingInitial.pollFirst();
             tracked.queuedForInitial = false;
 
@@ -567,10 +621,14 @@ public class chunksnapshot {
             unavailable = 0;
 
             // Остались другие запрошенные секции.
+
             if (tracked.pendingMask != 0) {
                 pendingInitial.addLast(tracked);
                 tracked.queuedForInitial = true;
+            } else {
+                metrics.initialComplete++;
             }
+
         }
     }
 
