@@ -20,6 +20,8 @@ import java.util.Deque;
 
 import javax.annotation.Nullable;
 
+import static com.kaboom.ModLogger.LOGGER;
+
 public class ChunkUpdateConroller implements IWorldEventListener{
     static final class ChunkState {
         boolean queued = false;
@@ -32,6 +34,18 @@ public class ChunkUpdateConroller implements IWorldEventListener{
     }
 
     private final chunksnapshot owner;
+
+    // Updated on the server thread only.
+    private static final class Metrics {
+        long blockEvents, duplicateEvents, dirtyQueued, dirtyChecks;
+        long dirtyStale, dirtyDeferredInitial, dirtyDeferredUnloaded;
+        long dirtySent, dirtyBlocks, dirtyFullSent, dirtyRejected, dirtyLimitHits;
+        long scanChecks, scanStale, scanDeferredInitial, scanDeferredUnloaded;
+        long scanSkippedDirty, scanCompared, scanChanged, scanUnchanged;
+        long scanLimitHits, fullResendsMarked, initialHashes;
+    }
+
+    private Metrics metrics = new Metrics();
 
     public ChunkUpdateConroller(chunksnapshot owner) {
         this.owner = owner;
@@ -82,8 +96,13 @@ public class ChunkUpdateConroller implements IWorldEventListener{
             state.dirtySections[sectionY] = dirty;
         }
 
+        metrics.blockEvents++;
+        if (dirty.get(index)) {
+            metrics.duplicateEvents++;
+        }
         dirty.set(index);
         if (!state.queued) {
+            metrics.dirtyQueued++;
             state.queued = true;
 
             pendingDirty.addLast(new DirtyChunk(
@@ -185,6 +204,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
         while (budget > 0 && checks-- > 0) {
             DirtyChunk request = pendingDirty.pollFirst();
+            metrics.dirtyChecks++;
 
             ChunkState state = owner.getUpdateState(
                     request.dimensionId,
@@ -194,6 +214,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
             // Запрос от уже удалённого или заменённого чанка.
             if (state != request.state) {
+                metrics.dirtyStale++;
                 continue;
             }
 
@@ -203,6 +224,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                     request.chunkX,
                     request.chunkZ
             )) {
+                metrics.dirtyDeferredInitial++;
                 pendingDirty.addLast(request);
                 continue;
             }
@@ -218,6 +240,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
             );
 
             if (chunk == null) {
+                metrics.dirtyDeferredUnloaded++;
                 pendingDirty.addLast(request);
                 continue;
             }
@@ -238,9 +261,20 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                         createChanges(world, chunk, request, sectionY, dirty);
 
                 if (!owner.offerUpdate(changes)) {
+                    metrics.dirtyRejected++;
+                    LOGGER.debug("Server delta offer rejected: dimension={}, chunk=({}, {}), section={}, blocks={}",
+                            request.dimensionId, request.chunkX, request.chunkZ, sectionY, changes.count);
                     queueFull = true;
                     break;
                 }
+                metrics.dirtySent++;
+                metrics.dirtyBlocks += changes.count;
+                if (changes.count == 4096) {
+                    metrics.dirtyFullSent++;
+                }
+                LOGGER.debug("Server delta sent: dimension={}, chunk=({}, {}), section={}, blocks={}, fullSection={}",
+                        request.dimensionId, request.chunkX, request.chunkZ, sectionY,
+                        changes.count, changes.count == 4096);
                 onFullSectionChangesSent(state, changes);
                 // Очищаем только после успешного принятия.
                 dirty.clear();
@@ -265,6 +299,9 @@ public class ChunkUpdateConroller implements IWorldEventListener{
             if (queueFull) {
                 break;
             }
+        }
+        if (budget == 0 && !pendingDirty.isEmpty()) {
+            metrics.dirtyLimitHits++;
         }
     }
 
@@ -306,6 +343,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
         );
 
         state.sectionHashReady[sectionY] = true;
+        metrics.initialHashes++;
     }
 
     private static final int MAX_SCAN_SECTIONS_PER_TICK = 1;
@@ -348,6 +386,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
         }
 
         dirty.set(0, 4096);
+        metrics.fullResendsMarked++;
 
         if (!state.queued) {
             state.queued = true;
@@ -364,6 +403,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
         while (budget > 0 && checks-- > 0) {
             DirtyChunk request = pendingScan.pollFirst();
+            metrics.scanChecks++;
 
             ChunkState state = owner.getUpdateState(
                     request.dimensionId,
@@ -373,6 +413,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
             // Отбрасываем записи удалённых чанков.
             if (state != request.state) {
+                metrics.scanStale++;
                 continue;
             }
 
@@ -385,6 +426,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                     request.chunkX,
                     request.chunkZ
             )) {
+                metrics.scanDeferredInitial++;
                 continue;
             }
 
@@ -399,6 +441,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
             );
 
             if (chunk == null) {
+                metrics.scanDeferredUnloaded++;
                 continue;
             }
 
@@ -409,6 +452,7 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
             // Не проверяем секцию с ещё не отправленными изменениями.
             if (dirty != null && !dirty.isEmpty()) {
+                metrics.scanSkippedDirty++;
                 budget--;
                 continue;
             }
@@ -427,13 +471,22 @@ public class ChunkUpdateConroller implements IWorldEventListener{
                     snapshot.resistance
             );
 
+            metrics.scanCompared++;
             if (!state.sectionHashReady[sectionY]
                     || state.sectionHashes[sectionY] != currentHash) {
-
+                metrics.scanChanged++;
+                LOGGER.debug("Server section hash mismatch: dimension={}, chunk=({}, {}), section={}, previousHash={}, currentHash={}, hashReady={}, fullResendQueued=true",
+                        request.dimensionId, request.chunkX, request.chunkZ, sectionY,
+                        state.sectionHashes[sectionY], currentHash, state.sectionHashReady[sectionY]);
                 markSectionDirty(request, sectionY);
+            } else {
+                metrics.scanUnchanged++;
             }
 
             budget--;
+        }
+        if (budget == 0 && !pendingScan.isEmpty()) {
+            metrics.scanLimitHits++;
         }
     }
 
@@ -456,7 +509,30 @@ public class ChunkUpdateConroller implements IWorldEventListener{
         state.sectionHashReady[sectionY] = true;
     }
 
+    void logMetricsIfDue(long elapsedMs) {
+        Metrics m = metrics;
+        metrics = new Metrics();
+        if (m.blockEvents > 0 || m.dirtyChecks > 0 || m.scanChecks > 0 || m.initialHashes > 0) {
+            LOGGER.info("Server chunk updates stats: elapsedMs={}, blockEvents={}, duplicateEvents={}, dirtyQueued={}, dirtyChecks={}, dirtyStale={}, dirtyDeferredInitial={}, dirtyDeferredUnloaded={}, dirtySent={}, dirtyBlocks={}, dirtyFullSent={}, dirtyRejected={}, dirtyLimitHits={}, dirtyQueue={}, scanChecks={}, scanStale={}, scanDeferredInitial={}, scanDeferredUnloaded={}, scanSkippedDirty={}, scanCompared={}, scanChanged={}, scanUnchanged={}, scanLimitHits={}, fullResendsMarked={}, initialHashes={}, scanQueue={}",
+                    elapsedMs, m.blockEvents, m.duplicateEvents,
+                    m.dirtyQueued, m.dirtyChecks, m.dirtyStale,
+                    m.dirtyDeferredInitial, m.dirtyDeferredUnloaded,
+                    m.dirtySent, m.dirtyBlocks, m.dirtyFullSent,
+                    m.dirtyRejected, m.dirtyLimitHits, pendingDirty.size(),
+                    m.scanChecks, m.scanStale, m.scanDeferredInitial,
+                    m.scanDeferredUnloaded, m.scanSkippedDirty, m.scanCompared,
+                    m.scanChanged, m.scanUnchanged, m.scanLimitHits,
+                    m.fullResendsMarked, m.initialHashes, pendingScan.size());
+        }
+        if (m.dirtyRejected > 0) {
+            LOGGER.warn("Server delta offers rejected: count={}, pendingDirty={}",
+                    m.dirtyRejected, pendingDirty.size());
+        }
+    }
+
     void stop() {
+        LOGGER.info("Server chunk updates stopping: pendingDirty={}, pendingScan={}",
+                pendingDirty.size(), pendingScan.size());
         pendingDirty.clear();
         pendingScan.clear();
     }
@@ -518,9 +594,11 @@ public class ChunkUpdateConroller implements IWorldEventListener{
 
     void registerWorld(WorldServer world) {
         world.addEventListener(this);
+        LOGGER.info("Server chunk listener registered: dimension={}", world.provider.getDimension());
     }
 
     void unregisterWorld(WorldServer world) {
         world.removeEventListener(this);
+        LOGGER.info("Server chunk listener unregistered: dimension={}", world.provider.getDimension());
     }
 }

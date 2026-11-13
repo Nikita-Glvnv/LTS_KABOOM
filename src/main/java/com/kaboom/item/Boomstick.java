@@ -1,6 +1,7 @@
 package com.kaboom.item;
 
 import com.kaboom.api.KaboomAPI;
+import static com.kaboom.ModLogger.LOGGER;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -63,6 +64,8 @@ public class Boomstick extends Item{
         if (!world.isRemote && world instanceof WorldServer) {
 
             int power = getExplosionPower(player.getHeldItem(hand));
+            LOGGER.info("Boomstick used: player={}, dimension={}, pos={}, power={}, hand={}, facing={}",
+                    player.getName(), world.provider.getDimension(), pos, power, hand, facing);
 
             KaboomAPI.createKABOOM(
                     (WorldServer) world,
