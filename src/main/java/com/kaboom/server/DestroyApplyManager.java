@@ -1,5 +1,6 @@
 package com.kaboom.server;
 
+import com.kaboom.network.BlockDestroyPackage;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.Objects;
@@ -20,6 +21,9 @@ public class DestroyApplyManager {
 
     private final BlockingQueue<DestroyRequest> destroyQueue =
             new ArrayBlockingQueue<>(MAX_DESTROY_REQUESTS);
+
+    private final BlockDestroyPackage blockDestroyPackage =
+            new BlockDestroyPackage();
 
     private static final class DestroyRequest {
         final int dimensionId;
@@ -46,9 +50,13 @@ public class DestroyApplyManager {
     private void applyPendingChanges() {
         long start = System.nanoTime();
 
-        processDestroyQueue(start);
+        try {
+            processDestroyQueue(start);
 
-        // Здесь позже появятся другие очереди.
+            // Здесь позже появятся другие очереди.
+        } finally {
+            blockDestroyPackage.flush();
+        }
     }
 
     private void processDestroyQueue(long start) {
@@ -102,7 +110,16 @@ public class DestroyApplyManager {
             return;
         }
 
-        world.setBlockState(pos, Blocks.AIR.getDefaultState(), 0);
+        if (world.setBlockState(
+                pos,
+                Blocks.AIR.getDefaultState(),
+                0
+        )) {
+            blockDestroyPackage.recordDestroy(
+                    request.dimensionId,
+                    pos
+            );
+        }
     }
 
     @SubscribeEvent

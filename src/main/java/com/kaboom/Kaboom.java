@@ -12,6 +12,7 @@ import net.minecraftforge.fml.common.event.*;
 import static com.kaboom.ModLogger.LOGGER;
 import com.kaboom.server.chunksnapshot;
 import com.kaboom.server.DestroyApplyManager;
+import com.kaboom.network.BlockDestroyPackage;
 
 @Mod(modid = Kaboom.MODID, name = Kaboom.NAME, version = Kaboom.VERSION)
 public class Kaboom
@@ -47,6 +48,7 @@ public class Kaboom
                     }
                 }
         );
+        BlockDestroyPackage.registerNetwork();
         ModLogger.initialize(
                 event.getModConfigurationDirectory().getParentFile()
         );
