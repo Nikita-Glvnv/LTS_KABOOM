@@ -1,86 +1,262 @@
 package com.kaboom.explosionwork;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-import com.kaboom.Kaboom;
-import com.kaboom.server.ChunkLoadingManager;
-import net.minecraft.util.math.ChunkPos;
+import static com.kaboom.ModLogger.LOGGER;
+import java.util.concurrent.locks.LockSupport;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 import net.minecraft.util.math.BlockPos;
 
 public class DimensionWorker {
     private final int dimensionId;
-    private static final int TEST_RADIUS = 64;
-    private static final long TEST_RETENTION_MS = 10_000L;
+    private final SnapshotManager snapshotManager;
 
-    public DimensionWorker(int dimensionId) {
-        this.dimensionId = dimensionId;
-    }
-    private static final Logger LOGGER =
-            LogManager.getLogger("LTS_KABOOM");
+    private static final int MAX_SNAPSHOTS_PER_TICK = 4;
+    private static final long TICK_NANOS = 50_000_000L;
+    private static final int MAX_EXPLOSIONS_PER_TICK = 64;
 
+    private final Queue<BlockPos> pendingExplosions =
+            new ConcurrentLinkedQueue<>();
 
-    private void requestTestChunks(BlockPos pos) {
+    private static final int LOG_INTERVAL_TICKS = 20;
+    private static final int IDLE_HEARTBEAT_INTERVALS = 60;
 
-        ChunkLoadingManager manager = Kaboom.getChunkLoadingManager();
+    private final AtomicLong acceptedExplosions = new AtomicLong();
+    // Счётчики меняются только в потоке данного измерения.
+    private long explosionAttempts;
+    private long explosionReady;
+    private long explosionDeferred;
+    private BlockPos processingPos;
 
-        if (manager == null) {
-            LOGGER.warn("ChunkLoadingManager is not initialized");
+    private final Thread workerThread;
+    private volatile boolean running;
+    private boolean started;
+
+    public synchronized void start() {
+        if (started) {
+            LOGGER.warn("DimensionWorker start ignored: dimension={}, already started", dimensionId);
             return;
         }
 
-        int centerX = pos.getX();
-        int centerZ = pos.getZ();
+        started = true;
+        running = true;
+        LOGGER.info(
+                "DimensionWorker starting: dimension={}, thread={}, tickMs={}, snapshotLimit={}, explosionLimit={}",
+                dimensionId, workerThread.getName(), TICK_NANOS / 1_000_000L,
+                MAX_SNAPSHOTS_PER_TICK, MAX_EXPLOSIONS_PER_TICK
+        );
+        workerThread.start();
+    }
 
-        int minChunkX = (centerX - TEST_RADIUS) >> 4;
-        int maxChunkX = (centerX + TEST_RADIUS) >> 4;
+    public void stop() {
+        LOGGER.info("DimensionWorker stop requested: dimension={}, pending={}, alive={}",
+                dimensionId, pendingExplosions.size(), workerThread.isAlive());
+        running = false;
+        LockSupport.unpark(workerThread);
 
-        int minChunkZ = (centerZ - TEST_RADIUS) >> 4;
-        int maxChunkZ = (centerZ + TEST_RADIUS) >> 4;
+        if (Thread.currentThread() != workerThread) {
+            try {
+                workerThread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("DimensionWorker stop interrupted: dimension={}", dimensionId, e);
+            }
+        }
+        LOGGER.info("DimensionWorker stop returned: dimension={}, pending={}, alive={}",
+                dimensionId, pendingExplosions.size(), workerThread.isAlive());
+    }
 
-        int count = 0;
+    private void runLoop() {
+        long nextTick = System.nanoTime();
+        long intervalStart = nextTick;
+        long acceptedAtLastReport = acceptedExplosions.get();
+        int ticks = 0;
+        int snapshots = 0;
+        int snapshotLimitHits = 0;
+        int explosionLimitHits = 0;
+        int overruns = 0;
+        int idleIntervals = 0;
+        long snapshotTimeNs = 0;
+        long explosionTimeNs = 0;
+        long maxTickTimeNs = 0;
+        boolean wasIdle = false;
+        String stage = "startup";
 
-        for (int cx = minChunkX; cx <= maxChunkX; cx++) {
+        LOGGER.info("DimensionWorker loop started: dimension={}, thread={}",
+                dimensionId, workerThread.getName());
 
-            int minX = cx << 4;
-            int maxX = minX + 15;
-
-            int nearestX = Math.max(minX, Math.min(centerX, maxX));
-            long dx = (long) nearestX - centerX;
-
-            for (int cz = minChunkZ; cz <= maxChunkZ; cz++) {
-
-                int minZ = cz << 4;
-                int maxZ = minZ + 15;
-
-                int nearestZ = Math.max(minZ, Math.min(centerZ, maxZ));
-                long dz = (long) nearestZ - centerZ;
-
-                if (dx * dx + dz * dz > TEST_RADIUS * TEST_RADIUS) {
+        try {
+            while (running) {
+                long remaining = nextTick - System.nanoTime();
+                if (remaining > 0) {
+                    LockSupport.parkNanos(remaining);
                     continue;
                 }
 
-                manager.requestChunk(
-                        dimensionId,
-                        new ChunkPos(cx, cz),
-                        TEST_RETENTION_MS
-                );
+                long tickStart = System.nanoTime();
 
-                count++;
+                stage = "snapshots";
+                long start = System.nanoTime();
+                int processed = snapshotManager.processIncomingSnapshots(MAX_SNAPSHOTS_PER_TICK);
+                snapshotTimeNs += System.nanoTime() - start;
+                snapshots += processed;
+                if (processed == MAX_SNAPSHOTS_PER_TICK) {
+                    snapshotLimitHits++;
+                }
+
+                stage = "explosions";
+                long attemptsBefore = explosionAttempts;
+                start = System.nanoTime();
+                processPendingExplosions();
+                explosionTimeNs += System.nanoTime() - start;
+                long attemptsThisTick = explosionAttempts - attemptsBefore;
+                if (attemptsThisTick == MAX_EXPLOSIONS_PER_TICK) {
+                    explosionLimitHits++;
+                }
+
+                boolean idle = processed == 0 && attemptsThisTick == 0;
+                if (idle != wasIdle) {
+                    LOGGER.debug("DimensionWorker state: dimension={}, state={}",
+                            dimensionId, idle ? "idle" : "active");
+                    wasIdle = idle;
+                }
+
+                maxTickTimeNs = Math.max(maxTickTimeNs, System.nanoTime() - tickStart);
+                nextTick += TICK_NANOS;
+                long now = System.nanoTime();
+                if (nextTick - now <= 0) {
+                    overruns++;
+                    nextTick = now + TICK_NANOS;
+                }
+
+                if (++ticks >= LOG_INTERVAL_TICKS) {
+                    long acceptedNow = acceptedExplosions.get();
+                    long accepted = acceptedNow - acceptedAtLastReport;
+                    if (accepted > 0 || snapshots > 0 || explosionAttempts > 0 || overruns > 0) {
+                        LOGGER.info(
+                                "DimensionWorker stats: dimension={}, elapsedMs={}, ticks={}, accepted={}, snapshots={}, snapshotLimitHits={}, explosionAttempts={}, explosionReady={}, explosionDeferred={}, explosionLimitHits={}, queuedExplosions={}, overruns={}, snapshotTimeUs={}, explosionTimeUs={}, maxTickUs={}",
+                                dimensionId, (now - intervalStart) / 1_000_000L, ticks,
+                                accepted, snapshots, snapshotLimitHits,
+                                explosionAttempts, explosionReady, explosionDeferred,
+                                explosionLimitHits, pendingExplosions.size(), overruns,
+                                snapshotTimeNs / 1_000L, explosionTimeNs / 1_000L,
+                                maxTickTimeNs / 1_000L
+                        );
+                        if (snapshotLimitHits == LOG_INTERVAL_TICKS
+                                || explosionLimitHits == LOG_INTERVAL_TICKS) {
+                            LOGGER.warn(
+                                    "DimensionWorker processing limit reached every tick: dimension={}, snapshotLimitHits={}, explosionLimitHits={}",
+                                    dimensionId, snapshotLimitHits, explosionLimitHits
+                            );
+                        }
+                        idleIntervals = 0;
+                    } else if (++idleIntervals >= IDLE_HEARTBEAT_INTERVALS) {
+                        LOGGER.debug("DimensionWorker heartbeat: dimension={}, queuedExplosions={}",
+                                dimensionId, pendingExplosions.size());
+                        idleIntervals = 0;
+                    }
+
+                    acceptedAtLastReport = acceptedNow;
+                    intervalStart = now;
+                    ticks = snapshots = snapshotLimitHits = explosionLimitHits = overruns = 0;
+                    explosionAttempts = explosionReady = explosionDeferred = 0;
+                    snapshotTimeNs = explosionTimeNs = maxTickTimeNs = 0;
+                }
             }
+        } catch (RuntimeException | Error e) {
+            LOGGER.error(
+                    "DimensionWorker failed: dimension=" + dimensionId
+                            + ", stage=" + stage
+                            + ", explosionPos=" + processingPos
+                            + ", queuedExplosions=" + pendingExplosions.size(),
+                    e
+            );
+            throw e;
+        } finally {
+            LOGGER.info("DimensionWorker loop finished: dimension={}, acceptedTotal={}, queuedExplosions={}",
+                    dimensionId, acceptedExplosions.get(), pendingExplosions.size());
         }
+    }
+
+    private void processPendingExplosions() {
+
+        int count = Math.min(
+                pendingExplosions.size(),
+                MAX_EXPLOSIONS_PER_TICK
+        );
+
+        oktoderevo.BlockResult result =
+                new oktoderevo.BlockResult();
+
+        for (int i = 0; i < count; i++) {
+
+            BlockPos pos = pendingExplosions.poll();
+
+            if (pos == null) {
+                break;
+            }
+
+            processingPos = pos;
+            explosionAttempts++;
+
+            boolean ready = snapshotManager.getBlock(
+                    pos.getX(),
+                    pos.getY(),
+                    pos.getZ(),
+                    result
+            );
+
+            if (!ready) {
+                pendingExplosions.offer(pos);
+                explosionDeferred++;
+                processingPos = null;
+                continue;
+            }
+
+            explosionReady++;
+            LOGGER.info(
+                    "Explosion block: dimension={}, pos={}, type={}, hardness={}, resistance={}",
+                    dimensionId,
+                    pos,
+                    result.type,
+                    result.hardness,
+                    result.resistance
+            );
+            processingPos = null;
+        }
+    }
+
+    public DimensionWorker(int dimensionId) {
+        this.dimensionId = dimensionId;
+        this.snapshotManager = new SnapshotManager(dimensionId);
+        this.workerThread = new Thread(
+                this::runLoop,
+                "LTS_KABOOM-Dimension-" + dimensionId
+        );
+        LOGGER.info("DimensionWorker created: dimension={}, thread={}",
+                dimensionId, workerThread.getName());
+    }
+
+    public void submitExplosion(BlockPos pos, int power) {
+
+        BlockPos capturedPos = new BlockPos(
+                pos.getX(),
+                pos.getY(),
+                pos.getZ()
+        );
+
+        pendingExplosions.offer(capturedPos);
+        long totalAccepted = acceptedExplosions.incrementAndGet();
 
         LOGGER.info(
-                "Chunk test: dimension={}, center={}, requested={}",
-                dimensionId, pos, count
+                "Explosion accepted: dimension={}, pos={}, power={}, acceptedTotal={}",
+                dimensionId, capturedPos, power, totalAccepted
         );
     }
-    public void submitExplosion(BlockPos pos, int power){
-        LOGGER.info(
-                "Explosion accepted: dimension={}, pos={}, power={}",
-                dimensionId, pos, power
-        );
-        requestTestChunks(pos);
+    public SnapshotManager getSnapshotManager() {
+        return snapshotManager;
+    }
 
-    }
+    //snapshotManager.processIncomingSnapshots(4);
 }

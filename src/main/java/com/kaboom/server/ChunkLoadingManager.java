@@ -5,8 +5,7 @@ import net.minecraft.world.WorldServer;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.event.world.WorldEvent;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import static com.kaboom.ModLogger.LOGGER;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import com.kaboom.Kaboom;
@@ -18,9 +17,6 @@ import java.util.concurrent.TimeUnit;
 
 public class ChunkLoadingManager {
     private static final int MAX_CHUNKS_PER_TICK = 2;
-
-    private static final Logger LOGGER =
-            LogManager.getLogger("LTS_KABOOM");
 
     private enum ChunkStatus {
         QUEUED,
