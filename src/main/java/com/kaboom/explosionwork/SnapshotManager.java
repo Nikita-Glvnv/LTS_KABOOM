@@ -7,9 +7,19 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
+import com.kaboom.Kaboom;
+import com.kaboom.server.ChunkLoadingManager;
+import java.util.concurrent.TimeUnit;
 
 public class SnapshotManager {
     private final int dimensionId;
+    private static final long CHUNK_RETENTION_MS = 30_000L;
+
+    private static final long REQUEST_INTERVAL_NANOS =
+            TimeUnit.SECONDS.toNanos(10);
+
+    private final Map<Long, Long> lastTrackingRequests =
+            new HashMap<>();
 
     private static final class StoredChunk {
 
@@ -129,7 +139,9 @@ public class SnapshotManager {
             oktoderevo.BlockResult result
     ) {
         Objects.requireNonNull(result, "result");
-
+        if (!ensureSectionTracked(x, y, z)) {
+            return false;
+        }
         // Проверяем допустимую высоту мира.
         if (y < 0 || y >= 256) {
             return false;
@@ -169,5 +181,56 @@ public class SnapshotManager {
         );
 
         return true;
+    }
+
+    public boolean ensureSectionTracked(int x, int y, int z) {
+
+        if (y < 0 || y >= 256) {
+            return false;
+        }
+
+        int chunkX = x >> 4;
+        int chunkZ = z >> 4;
+        int sectionY = y >> 4;
+
+        long key = ChunkPos.asLong(chunkX, chunkZ);
+
+        StoredChunk chunk = chunks.get(key);
+
+        boolean ready = chunk != null
+                && (chunk.readyMask & (1 << sectionY)) != 0
+                && chunk.sections[sectionY] != null;
+
+        long now = System.nanoTime();
+        Long lastRequest = lastTrackingRequests.get(key);
+
+        if (lastRequest == null
+                || now - lastRequest >= REQUEST_INTERVAL_NANOS) {
+
+            ChunkLoadingManager loadingManager =
+                    Kaboom.getChunkLoadingManager();
+
+            chunksnapshot snapshotService =
+                    Kaboom.getChunkSnapshot();
+
+            if (loadingManager != null && snapshotService != null) {
+
+                loadingManager.requestChunk(
+                        dimensionId,
+                        new ChunkPos(chunkX, chunkZ),
+                        CHUNK_RETENTION_MS
+                );
+
+                snapshotService.requestTracking(
+                        dimensionId,
+                        chunkX,
+                        chunkZ
+                );
+
+                lastTrackingRequests.put(key, now);
+            }
+        }
+
+        return ready;
     }
 }
