@@ -11,9 +11,13 @@ import com.kaboom.Kaboom;
 import com.kaboom.server.ChunkLoadingManager;
 import java.util.concurrent.TimeUnit;
 import java.util.Iterator;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static com.kaboom.ModLogger.LOGGER;
 
 public class SnapshotManager {
     private final int dimensionId;
+    private static final long LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long CHUNK_RETENTION_MS = 30_000L;
     private static final long INACTIVITY_TIMEOUT_NANOS =
             TimeUnit.SECONDS.toNanos(30);
@@ -23,6 +27,43 @@ public class SnapshotManager {
 
     private static final long REQUEST_INTERVAL_NANOS =
             TimeUnit.SECONDS.toNanos(10);
+
+    // Счётчики offerSnapshotUpdate обновляются серверным потоком.
+    private final AtomicLong offered = new AtomicLong();
+    private final AtomicLong rejectedNull = new AtomicLong();
+    private final AtomicLong rejectedDimension = new AtomicLong();
+    private final AtomicLong rejectedFullQueue = new AtomicLong();
+
+    // Остальные счётчики обновляет поток DimensionWorker.
+    private static final class Metrics {
+        long processed;
+        long limitHits;
+        long fullApplied;
+        long fullDiscarded;
+        long fullReplaced;
+        long deltasApplied;
+        long changedBlocks;
+        long chunksCreated;
+        long chunksCompleted;
+        long blockReads;
+        long blockHits;
+        long missingChunks;
+        long missingSections;
+        long invalidHeights;
+        long trackingChecks;
+        long trackingRequests;
+        long trackingRefreshes;
+        long trackingUnavailable;
+        long reactivations;
+        long trackingReleases;
+        long releaseFailures;
+        long chunksEvicted;
+        long processingNanos;
+        long cleanupNanos;
+    }
+
+    private Metrics metrics = new Metrics();
+    private long metricsWindowStart = System.nanoTime();
 
     private final Map<Long, Long> lastTrackingRequests =
             new HashMap<>();
@@ -44,6 +85,13 @@ public class SnapshotManager {
 
     public SnapshotManager(int dimensionId) {
         this.dimensionId = dimensionId;
+        LOGGER.info(
+                "SnapshotManager created: dimension={}, queueCapacity={}, inactivityMs={}, cleanupDelayMs={}, trackingIntervalMs={}",
+                dimensionId, QUEUE_CAPACITY,
+                TimeUnit.NANOSECONDS.toMillis(INACTIVITY_TIMEOUT_NANOS),
+                TimeUnit.NANOSECONDS.toMillis(SNAPSHOT_CLEANUP_DELAY_NANOS),
+                TimeUnit.NANOSECONDS.toMillis(REQUEST_INTERVAL_NANOS)
+        );
     }
 
     private static final int QUEUE_CAPACITY = 128;
@@ -52,17 +100,37 @@ public class SnapshotManager {
             incomingSections = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
     public boolean offerSnapshotUpdate(chunksnapshot.SnapshotUpdate update) {
-        return update != null
-                && update.getDimensionId() == dimensionId
-                && incomingSections.offer(update);
+        if (update == null) {
+            rejectedNull.incrementAndGet();
+            return false;
+        }
+        if (update.getDimensionId() != dimensionId) {
+            rejectedDimension.incrementAndGet();
+            return false;
+        }
+        if (!incomingSections.offer(update)) {
+            rejectedFullQueue.incrementAndGet();
+            return false;
+        }
+        offered.incrementAndGet();
+        return true;
     }
 
     public void acceptSectionChanges(chunksnapshot.SectionChanges changes) {
         if (changes.dimensionId != dimensionId) {
+            LOGGER.error(
+                    "SnapshotManager invalid delta dimension: expected={}, actual={}, chunk=({}, {}), section={}",
+                    dimensionId, changes.dimensionId,
+                    changes.chunkX, changes.chunkZ, changes.sectionY
+            );
             throw new IllegalArgumentException("Wrong dimension");
         }
 
         if (changes.sectionY < 0 || changes.sectionY >= 16) {
+            LOGGER.error(
+                    "SnapshotManager invalid delta section: dimension={}, chunk=({}, {}), section={}",
+                    dimensionId, changes.chunkX, changes.chunkZ, changes.sectionY
+            );
             throw new IllegalArgumentException("Invalid section Y");
         }
 
@@ -73,6 +141,11 @@ public class SnapshotManager {
         if (chunk == null
                 || (chunk.readyMask & (1 << changes.sectionY)) == 0
                 || chunk.sections[changes.sectionY] == null) {
+            LOGGER.error(
+                    "SnapshotManager delta before initial snapshot: dimension={}, chunk=({}, {}), section={}, readyMask={}",
+                    dimensionId, changes.chunkX, changes.chunkZ,
+                    changes.sectionY, chunk == null ? 0 : chunk.readyMask
+            );
             throw new IllegalStateException("Section is not initialized");
         }
 
@@ -83,42 +156,80 @@ public class SnapshotManager {
                 changes.resistance,
                 changes.count
         );
+
+        metrics.deltasApplied++;
+        metrics.changedBlocks += changes.count;
+        LOGGER.debug(
+                "SnapshotManager delta applied: dimension={}, chunk=({}, {}), section={}, blocks={}",
+                dimensionId, changes.chunkX, changes.chunkZ,
+                changes.sectionY, changes.count
+        );
     }
 
     public int processIncomingSnapshots(int maxSnapshots) {
-
+        long start = System.nanoTime();
         int processed = 0;
 
-        while (processed < maxSnapshots) {
+        try {
+            while (processed < maxSnapshots) {
+                chunksnapshot.SnapshotUpdate update = incomingSections.poll();
+                if (update == null) {
+                    break;
+                }
 
-            chunksnapshot.SnapshotUpdate update = incomingSections.poll();
+                if (update instanceof chunksnapshot.SectionSnapshot) {
+                    acceptFullSnapshot((chunksnapshot.SectionSnapshot) update);
+                } else if (update instanceof chunksnapshot.SectionChanges) {
+                    acceptSectionChanges((chunksnapshot.SectionChanges) update);
+                } else {
+                    throw new IllegalArgumentException("Unknown snapshot update: "
+                            + update.getClass().getName());
+                }
 
-            if (update == null) {
-                break;
+                processed++;
+                metrics.processed++;
             }
 
-            if (update instanceof chunksnapshot.SectionSnapshot) {
-                acceptFullSnapshot((chunksnapshot.SectionSnapshot) update);
-            } else if (update instanceof chunksnapshot.SectionChanges) {
-                acceptSectionChanges((chunksnapshot.SectionChanges) update);
-            } else {
-                throw new IllegalArgumentException("Unknown snapshot update");
+            if (maxSnapshots > 0 && processed == maxSnapshots
+                    && !incomingSections.isEmpty()) {
+                metrics.limitHits++;
             }
 
-            processed++;
+            long cleanupStart = System.nanoTime();
+            cleanupInactiveChunks();
+            metrics.cleanupNanos += System.nanoTime() - cleanupStart;
+            return processed;
+        } catch (RuntimeException | Error e) {
+            LOGGER.error(
+                    "SnapshotManager processing failed: dimension=" + dimensionId
+                            + ", processedBeforeFailure=" + processed
+                            + ", queuedUpdates=" + incomingSections.size(),
+                    e
+            );
+            throw e;
+        } finally {
+            metrics.processingNanos += System.nanoTime() - start;
+            logMetricsIfDue();
         }
-        cleanupInactiveChunks();
-        return processed;
     }
 
     public void acceptFullSnapshot(
             chunksnapshot.SectionSnapshot snapshot
     ) {
         if (snapshot.dimensionId != dimensionId) {
+            LOGGER.error(
+                    "SnapshotManager invalid full snapshot dimension: expected={}, actual={}, chunk=({}, {}), section={}",
+                    dimensionId, snapshot.dimensionId,
+                    snapshot.chunkX, snapshot.chunkZ, snapshot.sectionY
+            );
             throw new IllegalArgumentException("Wrong dimension");
         }
 
         if (snapshot.sectionY < 0 || snapshot.sectionY >= 16) {
+            LOGGER.error(
+                    "SnapshotManager invalid full snapshot section: dimension={}, chunk=({}, {}), section={}",
+                    dimensionId, snapshot.chunkX, snapshot.chunkZ, snapshot.sectionY
+            );
             throw new IllegalArgumentException("Invalid section Y");
         }
 
@@ -137,16 +248,53 @@ public class SnapshotManager {
 
         if (!lastBlockRequests.containsKey(key)
                 || inactiveSince.containsKey(key)) {
+            metrics.fullDiscarded++;
+            LOGGER.debug(
+                    "SnapshotManager full snapshot discarded: dimension={}, chunk=({}, {}), section={}, reason={}",
+                    dimensionId, snapshot.chunkX, snapshot.chunkZ, snapshot.sectionY,
+                    inactiveSince.containsKey(key) ? "inactive" : "not_requested"
+            );
             return;
         }
 
+        boolean newChunk = !chunks.containsKey(key);
         StoredChunk chunk = chunks.computeIfAbsent(
                 key,
                 k -> new StoredChunk()
         );
 
+        int previousMask = chunk.readyMask;
+        boolean replaced = chunk.sections[snapshot.sectionY] != null;
         chunk.sections[snapshot.sectionY] = section;
         chunk.readyMask |= 1 << snapshot.sectionY;
+
+        metrics.fullApplied++;
+        if (newChunk) {
+            metrics.chunksCreated++;
+            LOGGER.info(
+                    "SnapshotManager chunk snapshot created: dimension={}, chunk=({}, {})",
+                    dimensionId, snapshot.chunkX, snapshot.chunkZ
+            );
+        }
+        if (replaced) {
+            metrics.fullReplaced++;
+            LOGGER.debug(
+                    "SnapshotManager section snapshot replaced: dimension={}, chunk=({}, {}), section={}",
+                    dimensionId, snapshot.chunkX, snapshot.chunkZ, snapshot.sectionY
+            );
+        }
+        LOGGER.debug(
+                "SnapshotManager full section stored: dimension={}, chunk=({}, {}), section={}, readyMask={}",
+                dimensionId, snapshot.chunkX, snapshot.chunkZ,
+                snapshot.sectionY, chunk.readyMask
+        );
+        if (previousMask != 0xFFFF && chunk.readyMask == 0xFFFF) {
+            metrics.chunksCompleted++;
+            LOGGER.info(
+                    "SnapshotManager chunk snapshot complete: dimension={}, chunk=({}, {})",
+                    dimensionId, snapshot.chunkX, snapshot.chunkZ
+            );
+        }
     }
 
     public boolean getBlock(
@@ -154,7 +302,9 @@ public class SnapshotManager {
             oktoderevo.BlockResult result
     ) {
         Objects.requireNonNull(result, "result");
+        metrics.blockReads++;
         if (!ensureSectionTracked(x, y, z)) {
+            metrics.invalidHeights++;
             return false;
         }
         // Проверяем допустимую высоту мира.
@@ -173,17 +323,20 @@ public class SnapshotManager {
         );
 
         if (chunk == null) {
+            metrics.missingChunks++;
             return false;
         }
 
         // Проверяем готовность секции.
         if ((chunk.readyMask & (1 << sectionY)) == 0) {
+            metrics.missingSections++;
             return false;
         }
 
         oktoderevo section = chunk.sections[sectionY];
 
         if (section == null) {
+            metrics.missingSections++;
             return false;
         }
 
@@ -195,11 +348,13 @@ public class SnapshotManager {
                 result
         );
 
+        metrics.blockHits++;
         return true;
     }
 
     public boolean ensureSectionTracked(int x, int y, int z) {
 
+        metrics.trackingChecks++;
         if (y < 0 || y >= 256) {
             return false;
         }
@@ -217,6 +372,16 @@ public class SnapshotManager {
                 && chunk.sections[sectionY] != null;
 
         long now = System.nanoTime();
+        Long inactiveAt = inactiveSince.get(key);
+        if (inactiveAt != null) {
+            metrics.reactivations++;
+            LOGGER.warn(
+                    "SnapshotManager inactive chunk reactivated: dimension={}, chunk=({}, {}), inactiveMs={}, cachedReadyMask={}, snapshotMayBeStale=true",
+                    dimensionId, chunkX, chunkZ,
+                    TimeUnit.NANOSECONDS.toMillis(now - inactiveAt),
+                    chunk == null ? 0 : chunk.readyMask
+            );
+        }
         lastBlockRequests.put(key, now);
         inactiveSince.remove(key);
         chunkPositions.putIfAbsent(key, new ChunkPos(chunkX, chunkZ));
@@ -254,6 +419,17 @@ public class SnapshotManager {
                 );
 
                 lastTrackingRequests.put(key, now);
+                metrics.trackingRequests++;
+                if (lastRequest != null) {
+                    metrics.trackingRefreshes++;
+                }
+                LOGGER.debug(
+                        "SnapshotManager tracking requested: dimension={}, chunk=({}, {}), section={}, refresh={}",
+                        dimensionId, chunkX, chunkZ, sectionY,
+                        lastRequest != null
+                );
+            } else {
+                metrics.trackingUnavailable++;
             }
         }
 
@@ -288,6 +464,18 @@ public class SnapshotManager {
                             pos.x,
                             pos.z
                     );
+                    metrics.trackingReleases++;
+                    LOGGER.info(
+                            "SnapshotManager tracking released: dimension={}, chunk=({}, {}), idleMs={}",
+                            dimensionId, pos.x, pos.z,
+                            TimeUnit.NANOSECONDS.toMillis(now - entry.getValue())
+                    );
+                } else {
+                    metrics.releaseFailures++;
+                    LOGGER.warn(
+                            "SnapshotManager tracking release skipped: dimension={}, chunkKey={}, missingPosition={}, missingService={}",
+                            dimensionId, key, pos == null, snapshotService == null
+                    );
                 }
 
                 inactiveSince.put(key, now);
@@ -299,11 +487,70 @@ public class SnapshotManager {
                 continue;
             }
 
-            chunks.remove(key);
+            StoredChunk removed = chunks.remove(key);
+            ChunkPos pos = chunkPositions.get(key);
+            metrics.chunksEvicted++;
+            LOGGER.info(
+                    "SnapshotManager cached chunk evicted: dimension={}, chunk={}, hadSnapshot={}, readyMask={}, inactiveMs={}",
+                    dimensionId, pos,
+                    removed != null, removed == null ? 0 : removed.readyMask,
+                    TimeUnit.NANOSECONDS.toMillis(now - inactiveAt)
+            );
             lastTrackingRequests.remove(key);
             inactiveSince.remove(key);
             chunkPositions.remove(key);
             iterator.remove();
+        }
+    }
+
+    private void logMetricsIfDue() {
+        long now = System.nanoTime();
+        if (now - metricsWindowStart < LOG_INTERVAL_NANOS) {
+            return;
+        }
+
+        Metrics m = metrics;
+        metrics = new Metrics();
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(now - metricsWindowStart);
+        metricsWindowStart = now;
+
+        long accepted = offered.getAndSet(0);
+        long nullUpdates = rejectedNull.getAndSet(0);
+        long wrongDimension = rejectedDimension.getAndSet(0);
+        long queueFull = rejectedFullQueue.getAndSet(0);
+
+        if (accepted > 0 || nullUpdates > 0 || wrongDimension > 0
+                || queueFull > 0 || m.processed > 0 || m.blockReads > 0
+                || m.trackingReleases > 0 || m.chunksEvicted > 0
+                || m.trackingUnavailable > 0) {
+            LOGGER.info(
+                    "SnapshotManager stats: dimension={}, elapsedMs={}, offered={}, processed={}, processingLimitHits={}, queueSize={}, rejectedNull={}, rejectedDimension={}, rejectedQueueFull={}, fullApplied={}, fullDiscarded={}, fullReplaced={}, deltasApplied={}, changedBlocks={}, chunksCreated={}, chunksCompleted={}, blockReads={}, blockHits={}, missingChunks={}, missingSections={}, invalidHeights={}, trackingChecks={}, trackingRequests={}, trackingRefreshes={}, trackingUnavailable={}, reactivations={}, trackingReleases={}, releaseFailures={}, chunksEvicted={}, cachedChunks={}, inactiveChunks={}, processingTimeUs={}, cleanupTimeUs={}",
+                    dimensionId, elapsedMs, accepted, m.processed,
+                    m.limitHits, incomingSections.size(), nullUpdates,
+                    wrongDimension, queueFull, m.fullApplied, m.fullDiscarded,
+                    m.fullReplaced, m.deltasApplied, m.changedBlocks,
+                    m.chunksCreated, m.chunksCompleted, m.blockReads,
+                    m.blockHits, m.missingChunks, m.missingSections,
+                    m.invalidHeights, m.trackingChecks, m.trackingRequests,
+                    m.trackingRefreshes, m.trackingUnavailable,
+                    m.reactivations, m.trackingReleases, m.releaseFailures,
+                    m.chunksEvicted, chunks.size(), inactiveSince.size(),
+                    m.processingNanos / 1_000L, m.cleanupNanos / 1_000L
+            );
+        }
+
+        if (nullUpdates > 0 || wrongDimension > 0 || queueFull > 0) {
+            LOGGER.warn(
+                    "SnapshotManager incoming updates rejected: dimension={}, null={}, wrongDimension={}, queueFull={}, queued={}",
+                    dimensionId, nullUpdates, wrongDimension,
+                    queueFull, incomingSections.size()
+            );
+        }
+        if (m.trackingUnavailable > 0) {
+            LOGGER.warn(
+                    "SnapshotManager tracking service unavailable: dimension={}, attempts={}",
+                    dimensionId, m.trackingUnavailable
+            );
         }
     }
 }
