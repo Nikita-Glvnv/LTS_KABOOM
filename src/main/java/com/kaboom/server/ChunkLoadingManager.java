@@ -265,16 +265,6 @@ public class ChunkLoadingManager {
         if (dimensionTickets != null) {
 
             for (ForgeChunkManager.Ticket ticket : dimensionTickets) {
-
-                if (!ticket.getChunkList().isEmpty()) {
-                    LOGGER.error(
-                            "Dimension {} unloaded with {} chunks still forced",
-                            dimensionId,
-                            ticket.getChunkList().size()
-                    );
-                    continue;
-                }
-
                 ForgeChunkManager.releaseTicket(ticket);
                 releasedTickets++;
             }
