@@ -5,6 +5,8 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import com.kaboom.Kaboom;
+import com.kaboom.server.DestroyApplyManager;
 
 import net.minecraft.util.math.BlockPos;
 
@@ -223,6 +225,25 @@ public class DimensionWorker {
                     result.hardness,
                     result.resistance
             );
+            if (result.type != oktoderevo.AIR) {
+
+                DestroyApplyManager manager =
+                        Kaboom.getDestroyApplyManager();
+
+                if (manager != null
+                        && manager.submitDestroy(dimensionId, pos)) {
+
+                    snapshotManager.removeBlock(
+                            pos.getX(),
+                            pos.getY(),
+                            pos.getZ()
+                    );
+
+                } else {
+                    pendingExplosions.offer(pos);
+                    explosionDeferred++;
+                }
+            }
             processingPos = null;
         }
     }

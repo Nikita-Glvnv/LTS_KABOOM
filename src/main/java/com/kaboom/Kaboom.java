@@ -11,6 +11,8 @@ import net.minecraftforge.fml.common.Mod.EventHandler;
 import net.minecraftforge.fml.common.event.*;
 import static com.kaboom.ModLogger.LOGGER;
 import com.kaboom.server.chunksnapshot;
+import com.kaboom.server.DestroyApplyManager;
+import com.kaboom.network.BlockDestroyPackage;
 
 @Mod(modid = Kaboom.MODID, name = Kaboom.NAME, version = Kaboom.VERSION)
 public class Kaboom
@@ -29,6 +31,11 @@ public class Kaboom
         return chunkLoadingManager;
     }
 
+    private static DestroyApplyManager destroyApplyManager;
+    public static DestroyApplyManager getDestroyApplyManager() {
+        return destroyApplyManager;
+    }
+
     @EventHandler
     public void preInit(FMLPreInitializationEvent event)
     {
@@ -41,6 +48,7 @@ public class Kaboom
                     }
                 }
         );
+        BlockDestroyPackage.registerNetwork();
         ModLogger.initialize(
                 event.getModConfigurationDirectory().getParentFile()
         );
@@ -70,12 +78,18 @@ public class Kaboom
                         && explosionHandler.offerSnapshotUpdate(snapshot)
         );
         MinecraftForge.EVENT_BUS.register(chunkSnapshot);
+        destroyApplyManager = new DestroyApplyManager();
+        MinecraftForge.EVENT_BUS.register(destroyApplyManager);
     }
     @Mod.EventHandler
     public void onServerStopping(FMLServerStoppingEvent event) {
         if (explosionHandler != null) {
             explosionHandler.stop();
             explosionHandler = null;
+        }
+        if (destroyApplyManager != null) {
+            MinecraftForge.EVENT_BUS.unregister(destroyApplyManager);
+            destroyApplyManager = null;
         }
         if (chunkLoadingManager != null) {
             MinecraftForge.EVENT_BUS.unregister(chunkLoadingManager);
