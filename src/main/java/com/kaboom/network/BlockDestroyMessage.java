@@ -4,7 +4,6 @@ import io.netty.buffer.ByteBuf;
 import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
 import net.minecraftforge.fml.common.network.simpleimpl.IMessageHandler;
 import net.minecraftforge.fml.common.network.simpleimpl.MessageContext;
-
 import java.util.Arrays;
 
 public class BlockDestroyMessage implements IMessage {
@@ -82,5 +81,21 @@ public class BlockDestroyMessage implements IMessage {
         ) {
             return null;
         }
+    }
+
+    public int getDimensionId() {
+        return dimensionId;
+    }
+
+    public int getChunkX() {
+        return chunkX;
+    }
+
+    public int getChunkZ() {
+        return chunkZ;
+    }
+
+    public short[] getBlocks() {
+        return blocks;
     }
 }

@@ -1,8 +1,10 @@
 package com.kaboom.network;
 
 import com.kaboom.Kaboom;
+import com.kaboom.client.BlockDestroyHandler;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
+import net.minecraftforge.fml.common.FMLCommonHandler;
 import net.minecraftforge.fml.common.network.NetworkRegistry;
 import net.minecraftforge.fml.common.network.simpleimpl.SimpleNetworkWrapper;
 import net.minecraftforge.fml.relauncher.Side;
@@ -62,12 +64,21 @@ public class BlockDestroyPackage {
     }
 
     public static void registerNetwork() {
-        CHANNEL.registerMessage(
-                BlockDestroyMessage.Handler.class,
-                BlockDestroyMessage.class,
-                0,
-                Side.CLIENT
-        );
+        if (FMLCommonHandler.instance().getSide().isClient()) {
+            CHANNEL.registerMessage(
+                    BlockDestroyHandler.class,
+                    BlockDestroyMessage.class,
+                    0,
+                    Side.CLIENT
+            );
+        } else {
+            CHANNEL.registerMessage(
+                    BlockDestroyMessage.Handler.class,
+                    BlockDestroyMessage.class,
+                    0,
+                    Side.CLIENT
+            );
+        }
     }
 
     public void flush() {
