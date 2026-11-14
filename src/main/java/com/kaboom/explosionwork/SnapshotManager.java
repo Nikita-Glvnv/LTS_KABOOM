@@ -636,4 +636,40 @@ public class SnapshotManager {
             );
         }
     }
+
+    public boolean removeBlock(int x, int y, int z) {
+        if (y < 0 || y >= 256) {
+            return false;
+        }
+
+        long key = ChunkPos.asLong(x >> 4, z >> 4);
+
+        if (inactiveSince.containsKey(key)) {
+            return false;
+        }
+
+        StoredChunk chunk = chunks.get(key);
+
+        if (chunk == null) {
+            return false;
+        }
+
+        int sectionY = y >> 4;
+
+        if ((chunk.readyMask & (1 << sectionY)) == 0) {
+            return false;
+        }
+
+        oktoderevo section = chunk.sections[sectionY];
+
+        if (section == null) {
+            return false;
+        }
+
+        return section.removeBlock(
+                x & 15,
+                y & 15,
+                z & 15
+        );
+    }
 }

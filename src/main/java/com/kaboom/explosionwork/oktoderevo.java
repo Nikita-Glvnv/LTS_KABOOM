@@ -397,4 +397,54 @@ public class oktoderevo {
                 currentResistance
         );
     }
+
+    public boolean removeBlock(int x, int y, int z) {
+        if (((x | y | z) & ~15) != 0) {
+            return false;
+        }
+
+        int node = 0;
+
+        for (int shift = 3; shift >= 0; shift--) {
+            byte type = nodeType[node];
+
+            if (type == AIR) {
+                return false;
+            }
+
+            if (type != BRANCH) {
+                break;
+            }
+
+            int octant =
+                    ((x >> shift) & 1)
+                            | (((z >> shift) & 1) << 1)
+                            | (((y >> shift) & 1) << 2);
+
+            int mask = childMask[node] & 0xFF;
+            int bit = 1 << octant;
+
+            if ((mask & bit) == 0) {
+                return false;
+            }
+
+            node = firstChild[node]
+                    + Integer.bitCount(mask & (bit - 1));
+        }
+
+        if (nodeType[node] == AIR) {
+            return false;
+        }
+
+        if (nodeType[node] != BLOCK
+                && nodeType[node] != LIQUID) {
+            return false;
+        }
+
+        nodeType[node] = AIR;
+        hardness[node] = 0.0f;
+        resistance[node] = 0.0f;
+
+        return true;
+    }
 }
