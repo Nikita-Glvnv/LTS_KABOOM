@@ -7,37 +7,35 @@ import net.minecraftforge.fml.common.network.simpleimpl.MessageContext;
 
 import java.util.Arrays;
 
-public class BlockDestroyMessage {
-    public class BlockDestroyMessage implements IMessage {
-        public static final int MAX_BLOCKS = 1024;
+public class BlockDestroyMessage implements IMessage {
+    public static final int MAX_BLOCKS = 1024;
 
-        private int dimensionId;
-        private int chunkX;
-        private int chunkZ;
-        private short[] blocks;
+    private int dimensionId;
+    private int chunkX;
+    private int chunkZ;
+    private short[] blocks;
 
-        public BlockDestroyMessage() {
+    public BlockDestroyMessage() {
+    }
+
+    public BlockDestroyMessage(
+            int dimensionId,
+            int chunkX,
+            int chunkZ,
+            short[] source,
+            int offset,
+            int count
+    ) {
+        if (count <= 0 || count > MAX_BLOCKS) {
+            throw new IllegalArgumentException("Invalid block count");
         }
 
-        public BlockDestroyMessage(
-                int dimensionId,
-                int chunkX,
-                int chunkZ,
-                short[] source,
-                int offset,
-                int count
-        ) {
-            if (count <= 0 || count > MAX_BLOCKS) {
-                throw new IllegalArgumentException("Invalid block count");
-            }
-
-            this.dimensionId = dimensionId;
-            this.chunkX = chunkX;
-            this.chunkZ = chunkZ;
-            this.blocks = Arrays.copyOfRange(
-                    source, offset, offset + count
-            );
-        }
+        this.dimensionId = dimensionId;
+        this.chunkX = chunkX;
+        this.chunkZ = chunkZ;
+        this.blocks = Arrays.copyOfRange(
+                source, offset, offset + count
+        );
     }
 
     @Override
