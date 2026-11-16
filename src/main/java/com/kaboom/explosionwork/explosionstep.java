@@ -38,6 +38,13 @@ public class explosionstep {
 
     private static final int MAX_PREFETCH_SECTIONS_PER_STEP = 64;
 
+    private static final double[] ANGULAR_WEIGHT = {
+            0.0,
+            1.0 / 21.0,
+            4.0 / 105.0,
+            9.0 / 280.0
+    };
+
     // Секции, для которых уже проверена готовность в этом шаге.
     private final LongOpenHashSet prefetchedSections =
             new LongOpenHashSet();
@@ -653,10 +660,11 @@ public class explosionstep {
 
             dots[i] = dot;
 
-            double w = diffuse
-                    + (dot > 0.0
-                    ? k * Math.pow(dot, LOBE_POWER)
-                    : 0.0);
+            double w = ANGULAR_WEIGHT[LENGTH_CLASS[i]] *
+                    (diffuse
+                            + (dot > 0.0
+                            ? k * Math.pow(dot, LOBE_POWER)
+                            : 0.0));
 
             weights[i] = w;
             totalWeight += w;
@@ -671,16 +679,16 @@ public class explosionstep {
         double invWeight = 1.0 / totalWeight;
 
         // Затухание рассчитывается лишь для трёх расстояний.
-        double axial = Math.max(
-                0.0, available - AIR_ATTENUATION * LENGTH[1]
+        double axial = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[1] / available
         );
 
-        double face = Math.max(
-                0.0, available - AIR_ATTENUATION * LENGTH[2]
+        double face = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[2] / available
         );
 
-        double space = Math.max(
-                0.0, available - AIR_ATTENUATION * LENGTH[3]
+        double space = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[3] / available
         );
 
         // Распространение энергии.
