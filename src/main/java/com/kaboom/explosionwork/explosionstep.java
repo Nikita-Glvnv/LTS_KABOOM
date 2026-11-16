@@ -10,6 +10,8 @@ import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
     private static final double AIR_ATTENUATION = 0.15;
+    private static final double WEAK_WAVE_ENERGY_SCALE = 20.0;
+    private static final double WEAK_WAVE_FADE_SCALE = 0.05;
     private static final double LOBE_POWER = 2.2;
     private static final double DIRECTION_MEMORY = 0.6;
     private static final double MAX_REFLECTION = 0.40;
@@ -679,16 +681,23 @@ public class explosionstep {
         double invWeight = 1.0 / totalWeight;
 
         // Затухание рассчитывается лишь для трёх расстояний.
+        double energySquared = available * available;
+
+        double attenuationEnergy = available
+                + WEAK_WAVE_ENERGY_SCALE * WEAK_WAVE_ENERGY_SCALE * energySquared
+                / ((available + WEAK_WAVE_ENERGY_SCALE)
+                * (energySquared + WEAK_WAVE_FADE_SCALE * WEAK_WAVE_FADE_SCALE));
+
         double axial = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[1] / available
+                -AIR_ATTENUATION * LENGTH[1] / attenuationEnergy
         );
 
         double face = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[2] / available
+                -AIR_ATTENUATION * LENGTH[2] / attenuationEnergy
         );
 
         double space = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[3] / available
+                -AIR_ATTENUATION * LENGTH[3] / attenuationEnergy
         );
 
         // Распространение энергии.
