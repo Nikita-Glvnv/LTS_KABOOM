@@ -806,6 +806,10 @@ public class chunksnapshot {
                 && tracked.initializedMask == 0xFFFF;
     }
 
+    public void resetDimension(int dimensionId) {
+        unregisterDimension(dimensionId);
+    }
+
     boolean offerUpdate(SnapshotUpdate update) {
         return receiver.offer(update);
     }

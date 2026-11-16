@@ -59,6 +59,13 @@ public class DestroyApplyManager {
         }
     }
 
+    public void resetDimension(int dimensionId) {
+
+        destroyQueue.removeIf(
+                request -> request.dimensionId == dimensionId
+        );
+    }
+
     private void processDestroyQueue(long start) {
 
         for (int i = 0; i < MAX_DESTROYS_PER_TICK; i++) {

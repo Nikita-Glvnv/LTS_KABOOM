@@ -36,11 +36,14 @@ public class DimensionWorker {
     private long explosionReady;
     private long explosionDeferred;
     private BlockPos processingPos;
-
     private final Thread workerThread;
     private volatile boolean running;
+    private volatile boolean failed;
     private boolean started;
 
+    public boolean hasFailed() {
+        return failed;
+    }
     private static final class ExplosionRequest {
 
         final BlockPos pos;
@@ -309,6 +312,8 @@ public class DimensionWorker {
                 }
             }
         } catch (RuntimeException | Error e) {
+            failed = true;
+            running = false;
             LOGGER.error(
                     "DimensionWorker failed: dimension=" + dimensionId
                             + ", stage=" + stage

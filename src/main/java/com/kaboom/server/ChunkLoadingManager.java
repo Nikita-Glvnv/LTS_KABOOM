@@ -278,6 +278,10 @@ public class ChunkLoadingManager {
         );
     }
 
+    public void resetDimension(int dimensionId) {
+        releaseDimension(dimensionId);
+    }
+
     private int cleanupTickCounter;
 
     @SubscribeEvent

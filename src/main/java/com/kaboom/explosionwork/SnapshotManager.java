@@ -167,14 +167,19 @@ public class SnapshotManager {
         );
 
         if (chunk == null
-                || (chunk.readyMask & (1 << changes.sectionY)) == 0
+                || (chunk.readyMask & sectionBit) == 0
                 || chunk.sections[changes.sectionY] == null) {
-            LOGGER.error(
-                    "SnapshotManager delta before initial snapshot: dimension={}, chunk=({}, {}), section={}, readyMask={}",
-                    dimensionId, changes.chunkX, changes.chunkZ,
-                    changes.sectionY, chunk == null ? 0 : chunk.readyMask
+
+            LOGGER.debug(
+                    "SnapshotManager delta discarded: section not ready, " +
+                            "dimension={}, chunk=({}, {}), section={}",
+                    dimensionId,
+                    changes.chunkX,
+                    changes.chunkZ,
+                    changes.sectionY
             );
-            throw new IllegalStateException("Section is not initialized");
+
+            return;
         }
 
         chunk.sections[changes.sectionY].applyChanges(
@@ -414,6 +419,7 @@ public class SnapshotManager {
         Long inactiveAt = inactiveSince.remove(key);
 
         if (inactiveAt != null) {
+            discardQueuedDeltas(chunkX, chunkZ);
             StoredChunk old = chunks.remove(key);
 
             sectionRequests.remove(key);
@@ -541,6 +547,11 @@ public class SnapshotManager {
                 ChunkPos pos = chunkPositions.get(key);
 
                 if (pos != null && snapshotService != null) {
+                    ChunkPos inactivePos = chunkPositions.get(key);
+
+                    if (inactivePos != null) {
+                        discardQueuedDeltas(inactivePos.x, inactivePos.z);
+                    }
                     snapshotService.releaseTracking(
                             dimensionId,
                             pos.x,
@@ -671,5 +682,21 @@ public class SnapshotManager {
                 y & 15,
                 z & 15
         );
+    }
+
+    private void discardQueuedDeltas(int chunkX, int chunkZ) {
+
+        incomingSections.removeIf(update -> {
+
+            if (!(update instanceof chunksnapshot.SectionChanges)) {
+                return false;
+            }
+
+            chunksnapshot.SectionChanges changes =
+                    (chunksnapshot.SectionChanges) update;
+
+            return changes.chunkX == chunkX
+                    && changes.chunkZ == chunkZ;
+        });
     }
 }
