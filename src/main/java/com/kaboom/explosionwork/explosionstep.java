@@ -5,6 +5,7 @@ import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -337,44 +338,57 @@ public class explosionstep {
         );
     }
 
-    private int axisSolidMask(
+    private boolean loadAxisResistance(
             int x, int y, int z,
             SnapshotManager snapshots
     ) {
-        int mask = 0;
-
         for (int i = 0; i < 6; i++) {
 
             int ax = x + AX[i];
             int ay = y + AY[i];
             int az = z + AZ[i];
 
-            if (ay < 0 || ay >= 256) {
+            if (ay < 0 || ay >= 256
+                    || ax < -30000000 || ax > 30000000
+                    || az < -30000000 || az > 30000000) {
+
+                axisResistance[i] = 0.0;
                 continue;
             }
 
-            long p = pack(ax, ay, az);
-            byte solid = solidCache.get(p);
+            long pos = pack(ax, ay, az);
 
-            if (solid == -1) {
+            float resistance = materialResistanceCache.get(pos);
+
+            if (Float.isNaN(resistance)) {
 
                 if (!snapshots.getBlock(ax, ay, az, block)) {
-                    return -1;
+                    return false;
                 }
 
-                solid = (byte) (
-                        block.type == oktoderevo.BLOCK ? 1 : 0
-                );
+                boolean solid = block.type == oktoderevo.BLOCK;
 
-                solidCache.put(p, solid);
+                solidCache.put(pos, (byte) (solid ? 1 : 0));
+
+                if (!solid) {
+                    resistance = 0.0f;
+                } else if (block.hardness < 0.0f) {
+                    resistance = Float.POSITIVE_INFINITY;
+                } else {
+                    resistance = Math.max(0.0f, block.resistance);
+
+                    if (Float.isNaN(resistance)) {
+                        resistance = Float.POSITIVE_INFINITY;
+                    }
+                }
+
+                materialResistanceCache.put(pos, resistance);
             }
 
-            if (solid == 1) {
-                mask |= 1 << i;
-            }
+            axisResistance[i] = resistance;
         }
 
-        return mask;
+        return true;
     }
 
     public long getCurrentTick() {
@@ -389,6 +403,7 @@ public class explosionstep {
 
         currentBucket().clear();
         solidCache.clear();
+        materialResistanceCache.clear();
         nextCell = 0;
         currentTick++;
     }
@@ -412,6 +427,11 @@ public class explosionstep {
     private final Long2ByteOpenHashMap solidCache =
             new Long2ByteOpenHashMap();
 
+    private final Long2FloatOpenHashMap materialResistanceCache =
+            new Long2FloatOpenHashMap();
+
+    private final double[] axisResistance = new double[6];
+
     private final oktoderevo.BlockResult block =
             new oktoderevo.BlockResult();
 
@@ -426,6 +446,7 @@ public class explosionstep {
 
     public explosionstep() {
         solidCache.defaultReturnValue((byte) -1);
+        materialResistanceCache.defaultReturnValue(Float.NaN);
     }
 
     public int destroyedCount() {
@@ -580,20 +601,18 @@ public class explosionstep {
         // Блок либо отсутствует, либо будет разрушен.
         double available = incident - spent;
 
-        int solidMask = available > 0.0
-                ? axisSolidMask(x, y, z, snapshots)
-                : 0;
+        if (available > 0.0
+                && !loadAxisResistance(x, y, z, snapshots)) {
 
-        if (solidMask == -1) {
             return false;
         }
 
         if (wall) {
             absorbed += spent;
-            destroyed.add(pos);
 
-            // Разрушенный блок считается воздухом уже в этом шаге.
-            solidCache.put(pos, (byte) 0);
+            // Только регистрируем разрушение.
+            // Состояние материала текущего тика не меняем.
+            destroyed.add(pos);
         }
 
         if (available <= 0.0) {
@@ -626,11 +645,6 @@ public class explosionstep {
         double totalWeight = 0.0;
 
         for (int i = 0; i < DIRECTIONS; i++) {
-
-            if (blocked(i, solidMask)) {
-                weights[i] = 0.0;
-                continue;
-            }
 
             double dot =
                     vx * UX[i] +
@@ -680,12 +694,25 @@ public class explosionstep {
 
             int cls = LENGTH_CLASS[i];
 
-            double transmitted = weight * (
+            double afterAir = weight * (
                     cls == 1 ? axial
                             : cls == 2 ? face : space
             );
 
-            airAbsorbed += weight * available - transmitted;
+            airAbsorbed += weight * available - afterAir;
+
+// Дополнительное сопротивление материала
+// на диагональном участке траектории.
+            double extraResistance = diagonalResistance(i);
+
+            double transmitted = extraResistance == 0.0
+                    ? afterAir
+                    : afterAir * (
+                    available / (available + extraResistance)
+            );
+
+// Потери на прохождение промежуточного материала.
+            absorbed += afterAir - transmitted;
 
             if (transmitted <= 0.0) {
                 continue;
@@ -897,6 +924,39 @@ public class explosionstep {
         }
 
         return count;
+    }
+
+    private double diagonalResistance(int direction) {
+
+        int axes = LENGTH_CLASS[direction];
+
+        if (axes == 1) {
+            return 0.0;
+        }
+
+        double resistance = 0.0;
+
+        if (DX[direction] != 0) {
+            resistance += axisResistance[
+                    DX[direction] > 0 ? 0 : 1
+                    ];
+        }
+
+        if (DY[direction] != 0) {
+            resistance += axisResistance[
+                    DY[direction] > 0 ? 2 : 3
+                    ];
+        }
+
+        if (DZ[direction] != 0) {
+            resistance += axisResistance[
+                    DZ[direction] > 0 ? 4 : 5
+                    ];
+        }
+
+        double averageResistance = resistance / axes;
+
+        return averageResistance * (LENGTH[axes] - 1.0);
     }
 
 }
