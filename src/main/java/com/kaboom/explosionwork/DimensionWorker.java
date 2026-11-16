@@ -99,6 +99,15 @@ public class DimensionWorker {
         long snapshotTimeNs = 0;
         long explosionTimeNs = 0;
         long maxTickTimeNs = 0;
+        long physicsSteps = 0;
+        long physicsVisitedCells = 0;
+        long physicsDeferredCells = 0;
+        long physicsDestroyedBlocks = 0;
+        long physicsPrefetchChecks = 0;
+
+        long physicsTimeNs = 0;
+        long maxPhysicsStepNs = 0;
+        int maxPhysicsCells = 0;
         boolean wasIdle = false;
         String stage = "startup";
 
@@ -145,8 +154,29 @@ public class DimensionWorker {
 
                         stage = "physics";
 
+                        int activeCells = physics.currentBucket().cellCount;
+
+                        long physicsStart = System.nanoTime();
+
                         boolean finished =
                                 physics.step(snapshotManager);
+
+                        long duration = System.nanoTime() - physicsStart;
+
+                        physicsTimeNs += duration;
+                        maxPhysicsStepNs = Math.max(maxPhysicsStepNs, duration);
+                        maxPhysicsCells = Math.max(maxPhysicsCells, activeCells);
+
+                        if (finished) {
+                            physicsSteps++;
+
+                            physicsVisitedCells += activeCells;
+                            physicsDeferredCells += physics.getDeferredLastStep();
+                            physicsDestroyedBlocks += physics.destroyedCount();
+
+                            physicsPrefetchChecks +=
+                                    physics.getPrefetchedSectionsLastStep();
+                        }
 
                         if (finished) {
 
@@ -190,6 +220,53 @@ public class DimensionWorker {
 
                 if (++ticks >= LOG_INTERVAL_TICKS) {
                     long acceptedNow = acceptedExplosions.get();
+                    if (physicsSteps > 0
+                            || physics.hasPending()
+                            || pendingDestroyApply) {
+
+                        LOGGER.info(
+                                "ExplosionPhysics stats: dimension={}, elapsedMs={}, " +
+                                        "waveTick={}, steps={}, processedCells={}, " +
+                                        "deferredCells={}, maxCellsInStep={}, " +
+                                        "destroyedBlocks={}, prefetchChecks={}, " +
+                                        "pendingCells={}, pendingDestroyBlocks={}, " +
+                                        "pendingApply={}, physicsTimeUs={}, maxStepUs={}, " +
+                                        "totalAbsorbed={}, totalAirAbsorbed={}, " +
+                                        "totalEscaped={}, totalCulled={}",
+
+                                dimensionId,
+                                (now - intervalStart) / 1_000_000L,
+                                physics.getCurrentTick(),
+                                physicsSteps,
+                                physicsVisitedCells - physicsDeferredCells,
+                                physicsDeferredCells,
+                                maxPhysicsCells,
+                                physicsDestroyedBlocks,
+                                physicsPrefetchChecks,
+                                physics.getPendingCellCount(),
+                                Math.max(
+                                        0,
+                                        physics.destroyedCount() - nextDestroyedToApply
+                                ),
+                                pendingDestroyApply,
+                                physicsTimeNs / 1_000L,
+                                maxPhysicsStepNs / 1_000L,
+                                physics.getAbsorbed(),
+                                physics.getAirAbsorbed(),
+                                physics.getEscaped(),
+                                physics.getCulled()
+                        );
+
+                        if (maxPhysicsStepNs > TICK_NANOS) {
+                            LOGGER.warn(
+                                    "ExplosionPhysics slow step: dimension={}, " +
+                                            "maxStepMs={}, targetTickMs={}",
+                                    dimensionId,
+                                    maxPhysicsStepNs / 1_000_000L,
+                                    TICK_NANOS / 1_000_000L
+                            );
+                        }
+                    }
                     long accepted = acceptedNow - acceptedAtLastReport;
                     if (accepted > 0 || snapshots > 0 || explosionAttempts > 0 || overruns > 0) {
                         LOGGER.info(
@@ -220,6 +297,15 @@ public class DimensionWorker {
                     ticks = snapshots = snapshotLimitHits = explosionLimitHits = overruns = 0;
                     explosionAttempts = explosionReady = explosionDeferred = 0;
                     snapshotTimeNs = explosionTimeNs = maxTickTimeNs = 0;
+                    physicsSteps = 0;
+                    physicsVisitedCells = 0;
+                    physicsDeferredCells = 0;
+                    physicsDestroyedBlocks = 0;
+                    physicsPrefetchChecks = 0;
+
+                    physicsTimeNs = 0;
+                    maxPhysicsStepNs = 0;
+                    maxPhysicsCells = 0;
                 }
             }
         } catch (RuntimeException | Error e) {
@@ -287,6 +373,14 @@ public class DimensionWorker {
                     0.0,
                     0.0,
                     arrival
+            );
+            LOGGER.info(
+                    "ExplosionPhysics source activated: dimension={}, " +
+                            "pos={}, energy={}, arrivalTick={}",
+                    dimensionId,
+                    pos,
+                    request.power,
+                    (long) arrival
             );
 
             explosionReady++;

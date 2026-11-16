@@ -885,4 +885,18 @@ public class explosionstep {
         }
     }
 
+    public int getPrefetchedSectionsLastStep() {
+        return prefetchedSections.size();
+    }
+
+    public int getPendingCellCount() {
+        int count = 0;
+
+        for (WaveBucket bucket : pending) {
+            count += bucket.cellCount;
+        }
+
+        return count;
+    }
+
 }
