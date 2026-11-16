@@ -4,6 +4,7 @@ import java.util.Arrays;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -33,6 +34,19 @@ public class explosionstep {
     private static final int[] AX = {1, -1, 0, 0, 0, 0};
     private static final int[] AY = {0, 0, 1, -1, 0, 0};
     private static final int[] AZ = {0, 0, 0, 0, 1, -1};
+
+    private static final int MAX_PREFETCH_SECTIONS_PER_STEP = 64;
+
+    // Секции, для которых уже проверена готовность в этом шаге.
+    private final LongOpenHashSet prefetchedSections =
+            new LongOpenHashSet();
+
+    // Количество клеток, отложенных на последнем шаге.
+    private int deferredLastStep;
+
+    public int getDeferredLastStep() {
+        return deferredLastStep;
+    }
 
     static {
         int i = 0;
@@ -736,12 +750,23 @@ public class explosionstep {
             );
         }
 
-        WaveBucket b = currentBucket();
+        deferredLastStep = 0;
+        prefetchedSections.clear();
 
-        while (nextCell < b.cellCount) {
+        // Запрашиваем секции до начала расчёта.
+        prefetchPending(snapshots);
 
-            if (!processCell(b, nextCell, snapshots)) {
-                return false;
+        WaveBucket bucket = currentBucket();
+
+        while (nextCell < bucket.cellCount) {
+
+            if (!processCell(bucket, nextCell, snapshots)) {
+
+                // Отсутствует снимок: откладываем только
+                // эту клетку, продолжая остальные.
+                deferCell(bucket, nextCell);
+
+                deferredLastStep++;
             }
 
             nextCell++;
@@ -749,9 +774,115 @@ public class explosionstep {
 
         finishTick();
 
+        // Запрашиваем секции для новых передач,
+        // созданных только что завершённым шагом.
+        prefetchPending(snapshots);
+
         awaitingDestructionApply = !destroyed.isEmpty();
 
         return true;
+    }
+
+    private void prefetchSection(
+            int x, int y, int z,
+            SnapshotManager snapshots
+    ) {
+        if (y < 0 || y >= 256
+                || x < -30000000 || x > 30000000
+                || z < -30000000 || z > 30000000) {
+            return;
+        }
+
+        if (prefetchedSections.size()
+                >= MAX_PREFETCH_SECTIONS_PER_STEP) {
+            return;
+        }
+
+        // Уникальный ключ секции 16×16×16.
+        long sectionKey = pack(
+                x >> 4,
+                y >> 4,
+                z >> 4
+        );
+
+        // Одна проверка на секцию за шаг.
+        if (prefetchedSections.add(sectionKey)) {
+            snapshots.ensureSectionTracked(x, y, z);
+        }
+    }
+
+    private void prefetchPending(
+            SnapshotManager snapshots
+    ) {
+        // Сначала текущий тик, затем два будущих.
+        for (int offset = 0; offset < RING_SIZE; offset++) {
+
+            WaveBucket bucket = pending[
+                    (int) ((currentTick + offset) % RING_SIZE)
+                    ];
+
+            for (int c = 0; c < bucket.cellCount; c++) {
+
+                if (prefetchedSections.size()
+                        >= MAX_PREFETCH_SECTIONS_PER_STEP) {
+                    return;
+                }
+
+                long pos = bucket.position[c];
+
+                int x = unpackX(pos);
+                int y = unpackY(pos);
+                int z = unpackZ(pos);
+
+                // Секция, в которую прибывает волна.
+                prefetchSection(x, y, z, snapshots);
+
+                // Секции вокруг неё: понадобятся для проверки
+                // препятствий и заблокированных диагоналей.
+                for (int i = 0; i < 6; i++) {
+                    prefetchSection(
+                            x + AX[i],
+                            y + AY[i],
+                            z + AZ[i],
+                            snapshots
+                    );
+                }
+            }
+        }
+    }
+
+    private void deferCell(WaveBucket bucket, int cell) {
+
+        WaveBucket next = pending[
+                (int) ((currentTick + 1) % RING_SIZE)
+                ];
+
+        long target = bucket.position[cell];
+
+        // Переносим все входящие передачи по отдельности.
+        for (int link = bucket.firstLink[cell];
+             link != -1;
+             link = bucket.nextLink[link]) {
+
+            double energy = bucket.linkEnergy[link];
+
+            if (energy <= 0.0) {
+                continue;
+            }
+
+            double arrival =
+                    bucket.linkArrivalSum[link] / energy + 1.0;
+
+            next.add(
+                    bucket.linkSource[link],
+                    target,
+                    energy,
+                    bucket.linkMomentX[link],
+                    bucket.linkMomentY[link],
+                    bucket.linkMomentZ[link],
+                    arrival
+            );
+        }
     }
 
 }

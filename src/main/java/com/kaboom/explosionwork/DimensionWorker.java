@@ -13,12 +13,18 @@ import net.minecraft.util.math.BlockPos;
 public class DimensionWorker {
     private final int dimensionId;
     private final SnapshotManager snapshotManager;
+    private final explosionstep physics = new explosionstep();
+
+    // Результаты завершённого физического шага,
+// ещё не полностью переданные серверному потоку.
+    private boolean pendingDestroyApply;
+    private int nextDestroyedToApply;
 
     private static final int MAX_SNAPSHOTS_PER_TICK = 4;
     private static final long TICK_NANOS = 50_000_000L;
     private static final int MAX_EXPLOSIONS_PER_TICK = 64;
 
-    private final Queue<BlockPos> pendingExplosions =
+    private final Queue<ExplosionRequest> pendingExplosions =
             new ConcurrentLinkedQueue<>();
 
     private static final int LOG_INTERVAL_TICKS = 20;
@@ -34,6 +40,17 @@ public class DimensionWorker {
     private final Thread workerThread;
     private volatile boolean running;
     private boolean started;
+
+    private static final class ExplosionRequest {
+
+        final BlockPos pos;
+        final int power;
+
+        ExplosionRequest(BlockPos pos, int power) {
+            this.pos = pos;
+            this.power = power;
+        }
+    }
 
     public synchronized void start() {
         if (started) {
@@ -108,16 +125,55 @@ public class DimensionWorker {
                 }
 
                 stage = "explosions";
+
                 long attemptsBefore = explosionAttempts;
                 start = System.nanoTime();
-                processPendingExplosions();
+
+                boolean waveWasActive =
+                        physics.hasPending() || pendingDestroyApply;
+
+// Нельзя рассчитывать следующий шаг, пока
+// разрушения предыдущего не переданы серверу.
+                if (!pendingDestroyApply || applyPendingDestructions()) {
+
+                    // Регистрируем новые источники энергии.
+                    processPendingExplosions();
+
+                    // Расчёт выполняется только при наличии
+                    // активных или ожидающих волн.
+                    if (physics.hasPending()) {
+
+                        stage = "physics";
+
+                        boolean finished =
+                                physics.step(snapshotManager);
+
+                        if (finished) {
+
+                            // Шаг завершён. Передаём его разрушения.
+                            pendingDestroyApply = true;
+
+                            stage = "apply destructions";
+                            applyPendingDestructions();
+                        }
+                    }
+                }
+
                 explosionTimeNs += System.nanoTime() - start;
-                long attemptsThisTick = explosionAttempts - attemptsBefore;
+
+                long attemptsThisTick =
+                        explosionAttempts - attemptsBefore;
+
                 if (attemptsThisTick == MAX_EXPLOSIONS_PER_TICK) {
                     explosionLimitHits++;
                 }
 
-                boolean idle = processed == 0 && attemptsThisTick == 0;
+                boolean idle =
+                        processed == 0
+                                && attemptsThisTick == 0
+                                && !waveWasActive
+                                && !physics.hasPending()
+                                && !pendingDestroyApply;
                 if (idle != wasIdle) {
                     LOGGER.debug("DimensionWorker state: dimension={}, state={}",
                             dimensionId, idle ? "idle" : "active");
@@ -193,59 +249,99 @@ public class DimensionWorker {
 
         for (int i = 0; i < count; i++) {
 
-            BlockPos pos = pendingExplosions.poll();
+            ExplosionRequest request = pendingExplosions.poll();
 
-            if (pos == null) {
+            if (request == null) {
                 break;
             }
 
+            BlockPos pos = request.pos;
             processingPos = pos;
             explosionAttempts++;
 
-            boolean ready = snapshotManager.getBlock(
+            // Убеждаемся, что начальная секция доступна.
+            if (!snapshotManager.getBlock(
                     pos.getX(),
                     pos.getY(),
                     pos.getZ(),
                     result
-            );
-
-            if (!ready) {
-                pendingExplosions.offer(pos);
+            )) {
+                pendingExplosions.offer(request);
                 explosionDeferred++;
                 processingPos = null;
                 continue;
             }
 
-            explosionReady++;
-            LOGGER.info(
-                    "Explosion block: dimension={}, pos={}, type={}, hardness={}, resistance={}",
-                    dimensionId,
-                    pos,
-                    result.type,
-                    result.hardness,
-                    result.resistance
+            long packed = pos.toLong();
+
+            // Планируем начало взрыва на следующий
+            // физический тик. Это безопасно даже при
+            // частично обработанном текущем тике.
+            double arrival = physics.getCurrentTick() + 1.0;
+
+            physics.schedule(
+                    packed,
+                    packed,
+                    (double) request.power,
+                    0.0,
+                    0.0,
+                    0.0,
+                    arrival
             );
-            if (result.type != oktoderevo.AIR) {
 
-                DestroyApplyManager manager =
-                        Kaboom.getDestroyApplyManager();
+            explosionReady++;
 
-                if (manager != null
-                        && manager.submitDestroy(dimensionId, pos)) {
-
-                    snapshotManager.removeBlock(
-                            pos.getX(),
-                            pos.getY(),
-                            pos.getZ()
-                    );
-
-                } else {
-                    pendingExplosions.offer(pos);
-                    explosionDeferred++;
-                }
-            }
             processingPos = null;
         }
+    }
+
+    private boolean applyPendingDestructions() {
+
+        int count = physics.destroyedCount();
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (nextDestroyedToApply < count && manager == null) {
+            return false;
+        }
+
+        while (nextDestroyedToApply < count) {
+
+            long packed =
+                    physics.destroyedAt(nextDestroyedToApply);
+
+            BlockPos pos = BlockPos.fromLong(packed);
+
+            // Передаём разрушение на Server Thread.
+            if (!manager.submitDestroy(dimensionId, pos)) {
+                return false;
+            }
+
+            // После успешной постановки в серверную очередь
+            // обновляем снимок для дальнейших расчётов.
+            if (!snapshotManager.removeBlock(
+                    pos.getX(),
+                    pos.getY(),
+                    pos.getZ()
+            )) {
+                LOGGER.warn(
+                        "Failed to remove destroyed block from snapshot: dimension={}, pos={}",
+                        dimensionId, pos
+                );
+            }
+
+            // Увеличиваем индекс только после принятия
+            // разрушения серверной очередью.
+            nextDestroyedToApply++;
+        }
+
+        physics.clearDestroyed();
+
+        nextDestroyedToApply = 0;
+        pendingDestroyApply = false;
+
+        return true;
     }
 
     public DimensionWorker(int dimensionId) {
@@ -267,7 +363,9 @@ public class DimensionWorker {
                 pos.getZ()
         );
 
-        pendingExplosions.offer(capturedPos);
+        pendingExplosions.offer(
+                new ExplosionRequest(capturedPos, power)
+        );
         long totalAccepted = acceptedExplosions.incrementAndGet();
 
         LOGGER.info(
