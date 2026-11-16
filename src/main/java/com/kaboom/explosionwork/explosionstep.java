@@ -323,6 +323,46 @@ public class explosionstep {
         );
     }
 
+    private int axisSolidMask(
+            int x, int y, int z,
+            SnapshotManager snapshots
+    ) {
+        int mask = 0;
+
+        for (int i = 0; i < 6; i++) {
+
+            int ax = x + AX[i];
+            int ay = y + AY[i];
+            int az = z + AZ[i];
+
+            if (ay < 0 || ay >= 256) {
+                continue;
+            }
+
+            long p = pack(ax, ay, az);
+            byte solid = solidCache.get(p);
+
+            if (solid == -1) {
+
+                if (!snapshots.getBlock(ax, ay, az, block)) {
+                    return -1;
+                }
+
+                solid = (byte) (
+                        block.type == oktoderevo.BLOCK ? 1 : 0
+                );
+
+                solidCache.put(p, solid);
+            }
+
+            if (solid == 1) {
+                mask |= 1 << i;
+            }
+        }
+
+        return mask;
+    }
+
     public long getCurrentTick() {
         return currentTick;
     }
