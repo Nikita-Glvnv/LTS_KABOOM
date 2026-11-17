@@ -10,8 +10,8 @@ import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
     private static final double AIR_ATTENUATION = 0.15;
-    private static final double WEAK_WAVE_ENERGY_SCALE = 20.0;
-    private static final double WEAK_WAVE_FADE_SCALE = 0.05;
+    private static final double WEAK_WAVE_ENERGY_SCALE = 10.0;
+    private static final double WEAK_WAVE_FADE_SCALE = 0.1;
     private static final double LOBE_POWER = 2.2;
     private static final double DIRECTION_MEMORY = 0.6;
     private static final double MAX_REFLECTION = 0.40;
@@ -85,6 +85,16 @@ public class explosionstep {
                 }
             }
         }
+    }
+
+    private static double materialLossFactor(double resistance) {
+        double r = Math.max(0.0, resistance);
+
+        double q = 0.3 / r;
+        double q2 = q * q;
+        double q4 = q2 * q2;
+
+        return 1.0 / (1.0 + q4 * q4 * q2);
     }
 
     private static long pack(int x, int y, int z) {
@@ -388,6 +398,8 @@ public class explosionstep {
 
                     if (Float.isNaN(resistance)) {
                         resistance = Float.POSITIVE_INFINITY;
+                    } else {
+                        resistance *= materialLossFactor(resistance);
                     }
                 }
 
@@ -557,11 +569,16 @@ public class explosionstep {
                     ? MAX_REFLECTION
                     : MAX_REFLECTION * h / (h + HARDNESS_SCALE);
 
-            spent = Math.max(0.0, resistance)
-                    * DESTRUCTION_MULTIPLIER;
+            double destructionThreshold =
+                    Math.max(0.0, resistance)
+                            * DESTRUCTION_MULTIPLIER;
+
+            spent = destructionThreshold
+                    * materialLossFactor(resistance);
 
             // Блок выдерживает удар.
-            if (h < 0.0 || incident * (1.0 - reflect) < spent) {
+            if (h < 0.0
+                    || incident * (1.0 - reflect) < destructionThreshold) {
 
                 absorbed += incident * (1.0 - reflect);
 
