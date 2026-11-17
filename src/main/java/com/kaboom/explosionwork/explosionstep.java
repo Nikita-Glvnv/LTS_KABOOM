@@ -211,6 +211,8 @@ public class explosionstep {
     }
 
     static final class WaveBucket {
+        private static final int DIRECT_INDEX_THRESHOLD = 6;
+        private static final int SOURCE_SLOTS = 27;
 
         private final Long2IntOpenHashMap cellIndex =
                 new Long2IntOpenHashMap();
@@ -229,6 +231,10 @@ public class explosionstep {
 
         // Индекс первой входящей передачи клетки.
         int[] firstLink = new int[64];
+
+        private int[] directOffset = new int[64];
+        private int[] directLinks = new int[SOURCE_SLOTS * 8];
+        private int directLinksUsed;
 
         // Входящие передачи.
         long[] linkSource = new long[128];
@@ -266,6 +272,7 @@ public class explosionstep {
                 arrivalSum[c] = 0.0;
 
                 firstLink[c] = -1;
+                directOffset[c] = -1;
             }
 
             // Суммарные данные клетки.
@@ -276,20 +283,51 @@ public class explosionstep {
             arrivalSum[c] += e * arrival;
 
             // Проверяем, была ли передача из этого источника.
-            for (int link = firstLink[c];
-                 link != -1;
-                 link = nextLink[link]) {
+            int offset = directOffset[c];
+            int slot = -1;
+            int foundLink = -1;
+            int previousLinks = 0;
 
-                if (linkSource[link] == source) {
+            if (offset >= 0) {
+                slot = sourceSlot(source, target);
 
-                    linkEnergy[link] += e;
-                    linkMomentX[link] += mx;
-                    linkMomentY[link] += my;
-                    linkMomentZ[link] += mz;
-                    linkArrivalSum[link] += e * arrival;
+                if (slot >= 0) {
+                    int indexed = directLinks[offset + slot];
+                    if (indexed != 0) {
+                        foundLink = indexed - 1;
+                    }
+                } else {
+                    for (int link = firstLink[c];
+                         link != -1;
+                         link = nextLink[link]) {
 
-                    return;
+                        if (linkSource[link] == source) {
+                            foundLink = link;
+                            break;
+                        }
+                    }
                 }
+            } else {
+                for (int link = firstLink[c];
+                     link != -1;
+                     link = nextLink[link]) {
+
+                    previousLinks++;
+
+                    if (linkSource[link] == source) {
+                        foundLink = link;
+                        break;
+                    }
+                }
+            }
+
+            if (foundLink != -1) {
+                linkEnergy[foundLink] += e;
+                linkMomentX[foundLink] += mx;
+                linkMomentY[foundLink] += my;
+                linkMomentZ[foundLink] += mz;
+                linkArrivalSum[foundLink] += e * arrival;
+                return;
             }
 
             // Новый источник: создаём запись передачи.
@@ -308,6 +346,13 @@ public class explosionstep {
 
             nextLink[link] = firstLink[c];
             firstLink[c] = link;
+            if (offset >= 0) {
+                if (slot >= 0) {
+                    directLinks[offset + slot] = link + 1;
+                }
+            } else if (previousLinks + 1 >= DIRECT_INDEX_THRESHOLD) {
+                buildDirectIndex(c);
+            }
         }
 
         private void growCells() {
@@ -327,6 +372,7 @@ public class explosionstep {
             arrivalSum = Arrays.copyOf(arrivalSum, n);
 
             firstLink = Arrays.copyOf(firstLink, n);
+            directOffset = Arrays.copyOf(directOffset, n);
         }
 
         private void growLinks() {
@@ -354,6 +400,50 @@ public class explosionstep {
 
             cellCount = 0;
             linkCount = 0;
+
+            directLinksUsed = 0;
+        }
+
+        private static int sourceSlot(long source, long target) {
+            int dx = unpackX(source) - unpackX(target);
+            int dy = unpackY(source) - unpackY(target);
+            int dz = unpackZ(source) - unpackZ(target);
+
+            if (dx < -1 || dx > 1
+                    || dy < -1 || dy > 1
+                    || dz < -1 || dz > 1) {
+                return -1;
+            }
+
+            return (dx + 1) * 9 + (dy + 1) * 3 + (dz + 1);
+        }
+
+        private void buildDirectIndex(int c) {
+            int offset = directLinksUsed;
+            int end = offset + SOURCE_SLOTS;
+
+            if (end > directLinks.length) {
+                directLinks = Arrays.copyOf(
+                        directLinks,
+                        Math.max(end, directLinks.length * 2)
+                );
+            }
+
+            Arrays.fill(directLinks, offset, end, 0);
+
+            for (int link = firstLink[c];
+                 link != -1;
+                 link = nextLink[link]) {
+
+                int slot = sourceSlot(linkSource[link], position[c]);
+
+                if (slot >= 0) {
+                    directLinks[offset + slot] = link + 1;
+                }
+            }
+
+            directOffset[c] = offset;
+            directLinksUsed = end;
         }
     }
 
@@ -1278,8 +1368,6 @@ public class explosionstep {
         if (energy <= 0.0) {
             return 0.0;
         }
-
-        double e2 = energy * energy;
 
         double attenuationEnergy = attenuationEnergy(energy);
 
