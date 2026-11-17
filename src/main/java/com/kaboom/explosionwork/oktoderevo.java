@@ -405,6 +405,9 @@ public class oktoderevo {
 
         int node = 0;
 
+        int[] parents = new int[4];
+        int parentCount = 0;
+
         for (int shift = 3; shift >= 0; shift--) {
             byte type = nodeType[node];
 
@@ -415,6 +418,8 @@ public class oktoderevo {
             if (type != BRANCH) {
                 break;
             }
+
+            parents[parentCount++] = node;
 
             int octant =
                     ((x >> shift) & 1)
@@ -445,6 +450,97 @@ public class oktoderevo {
         hardness[node] = 0.0f;
         resistance[node] = 0.0f;
 
+        for (int p = parentCount - 1; p >= 0; p--) {
+            int parent = parents[p];
+            int mask = childMask[parent] & 0xFF;
+            int count = Integer.bitCount(mask);
+            int first = firstChild[parent];
+
+            boolean allAir = true;
+
+            for (int i = 0; i < count; i++) {
+                if (nodeType[first + i] != AIR) {
+                    allAir = false;
+                    break;
+                }
+            }
+
+            if (!allAir) {
+                break;
+            }
+
+            nodeType[parent] = AIR;
+            childMask[parent] = 0;
+            firstChild[parent] = 0;
+            hardness[parent] = 0.0f;
+            resistance[parent] = 0.0f;
+        }
+
+        return true;
+    }
+
+    public static final class AirRegion {
+        public int x, y, z;
+        public int size;
+    }
+
+    public boolean getAirRegion(
+            int x, int y, int z,
+            AirRegion result
+    ) {
+        if (((x | y | z) & ~15) != 0) {
+            throw new IllegalArgumentException("Invalid coordinates");
+        }
+
+        result.size = 0;
+
+        int node = 0;
+
+        for (int shift = 3; shift >= 0; shift--) {
+            int size = 1 << (shift + 1);
+
+            if (nodeType[node] == AIR) {
+                result.x = x & ~(size - 1);
+                result.y = y & ~(size - 1);
+                result.z = z & ~(size - 1);
+                result.size = size;
+                return true;
+            }
+
+            if (nodeType[node] != BRANCH) {
+                return false;
+            }
+
+            int octant =
+                    ((x >> shift) & 1)
+                            | (((z >> shift) & 1) << 1)
+                            | (((y >> shift) & 1) << 2);
+
+            int mask = childMask[node] & 0xFF;
+            int bit = 1 << octant;
+
+            if ((mask & bit) == 0) {
+                size = 1 << shift;
+
+                result.x = x & ~(size - 1);
+                result.y = y & ~(size - 1);
+                result.z = z & ~(size - 1);
+                result.size = size;
+                return true;
+            }
+
+            node = firstChild[node]
+                    + Integer.bitCount(mask & (bit - 1));
+        }
+
+        if (nodeType[node] != AIR) {
+            return false;
+        }
+
+        result.x = x;
+        result.y = y;
+        result.z = z;
+        result.size = 1;
         return true;
     }
 }

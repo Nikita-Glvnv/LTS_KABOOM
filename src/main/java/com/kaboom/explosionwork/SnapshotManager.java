@@ -718,4 +718,41 @@ public class SnapshotManager {
                 && (chunk.readyMask & (1 << sectionY)) != 0
                 && chunk.sections[sectionY] != null;
     }
+
+    public boolean getAirRegionIfReady(
+            int x, int y, int z,
+            oktoderevo.AirRegion result
+    ) {
+        result.size = 0;
+
+        if (y < 0 || y >= 256) {
+            return false;
+        }
+
+        long key = ChunkPos.asLong(x >> 4, z >> 4);
+
+        if (inactiveSince.containsKey(key)) {
+            return false;
+        }
+
+        StoredChunk chunk = chunks.get(key);
+        int sectionY = y >> 4;
+
+        if (chunk == null
+                || (chunk.readyMask & (1 << sectionY)) == 0
+                || chunk.sections[sectionY] == null) {
+            return false;
+        }
+
+        if (!chunk.sections[sectionY].getAirRegion(
+                x & 15, y & 15, z & 15, result)) {
+            return false;
+        }
+
+        result.x += x & ~15;
+        result.y += y & ~15;
+        result.z += z & ~15;
+
+        return true;
+    }
 }

@@ -60,6 +60,21 @@ public class explosionstep {
         return deferredLastStep;
     }
 
+    private static final int MIN_MACRO_HOPS = 6;
+    private static final int MAX_MACRO_HOPS = 12;
+    private static final double MIN_MACRO_ENERGY = 0.5;
+    private static final double MIN_MACRO_COHERENCE = 0.94;
+
+    private final oktoderevo.AirRegion macroRegion =
+            new oktoderevo.AirRegion();
+
+    private final int[] macroX = new int[7];
+    private final int[] macroY = new int[7];
+    private final int[] macroZ = new int[7];
+
+    private final Long2ObjectOpenHashMap<WaveBucket> distantPending =
+            new Long2ObjectOpenHashMap<>();
+
     static {
         int i = 0;
 
@@ -461,6 +476,10 @@ public class explosionstep {
         if (!waitingBySection.isEmpty()) {
             return true;
         }
+
+        if (!distantPending.isEmpty()) {
+            return true;
+        }
         for (WaveBucket bucket : pending) {
             if (bucket.cellCount != 0) {
                 return true;
@@ -740,17 +759,9 @@ public class explosionstep {
                 / ((available + WEAK_WAVE_ENERGY_SCALE)
                 * (energySquared + WEAK_WAVE_FADE_SCALE * WEAK_WAVE_FADE_SCALE));
 
-        double axial = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[1] / attenuationEnergy
-        );
-
-        double face = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[2] / attenuationEnergy
-        );
-
-        double space = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[3] / attenuationEnergy
-        );
+        double axial = airAfterDistance(available, LENGTH[1]);
+        double face = airAfterDistance(available, LENGTH[2]);
+        double space = airAfterDistance(available, LENGTH[3]);
 
         // Распространение энергии.
         for (int i = 0; i < DIRECTIONS; i++) {
@@ -829,6 +840,19 @@ public class explosionstep {
                 oy = (a * vy + bb * oy) * inv;
                 oz = (a * vz + bb * oz) * inv;
             }
+            if (k >= MIN_MACRO_COHERENCE
+                    && weight >= 0.03
+                    && tryMacroEmit(
+                    nx, ny, nz,
+                    i,
+                    transmitted,
+                    ox, oy, oz,
+                    meanArrival + LENGTH[cls],
+                    k,
+                    snapshots
+            )) {
+                continue;
+            }
 
             emit(
                     pos,
@@ -851,6 +875,8 @@ public class explosionstep {
                     "Apply destroyed blocks before the next step"
             );
         }
+
+        activateDistant();
 
         deferredLastStep = 0;
         cellsLastStep = 0;
@@ -1006,6 +1032,10 @@ public class explosionstep {
             count += bucket.cellCount;
         }
 
+        for (WaveBucket bucket : distantPending.values()) {
+            count += bucket.cellCount;
+        }
+
         return count;
     }
 
@@ -1112,6 +1142,254 @@ public class explosionstep {
                 }
             }
         }
+    }
+
+    private void emitAt(
+            long source, long target,
+            double energy,
+            double mx, double my, double mz,
+            double arrival
+    ) {
+        if (energy <= 0.0) {
+            return;
+        }
+
+        if (energy < MIN_ACTIVE_ENERGY) {
+            culled += energy;
+            return;
+        }
+
+        long tick = (long) Math.floor(arrival);
+
+        if (tick < currentTick) {
+            throw new IllegalStateException("Past wave arrival");
+        }
+
+        WaveBucket destination;
+
+        if (tick < currentTick + RING_SIZE) {
+            destination = pending[(int) (tick % RING_SIZE)];
+        } else {
+            destination = distantPending.get(tick);
+
+            if (destination == null) {
+                destination = new WaveBucket();
+                distantPending.put(tick, destination);
+            }
+        }
+
+        destination.add(
+                source, target,
+                energy, mx, my, mz, arrival
+        );
+    }
+
+    private void activateDistant() {
+        WaveBucket ready = distantPending.remove(currentTick);
+
+        if (ready == null) {
+            return;
+        }
+
+        WaveBucket active = currentBucket();
+
+        for (int c = 0; c < ready.cellCount; c++) {
+            long target = ready.position[c];
+
+            for (int link = ready.firstLink[c];
+                 link != -1;
+                 link = ready.nextLink[link]) {
+
+                double energy = ready.linkEnergy[link];
+
+                if (energy <= 0.0) {
+                    continue;
+                }
+
+                active.add(
+                        ready.linkSource[link],
+                        target,
+                        energy,
+                        ready.linkMomentX[link],
+                        ready.linkMomentY[link],
+                        ready.linkMomentZ[link],
+                        ready.linkArrivalSum[link] / energy
+                );
+            }
+        }
+    }
+
+    private static double airAfterDistance(
+            double energy,
+            double distance
+    ) {
+        if (energy <= 0.0) {
+            return 0.0;
+        }
+
+        double e2 = energy * energy;
+
+        double attenuationEnergy = energy
+                + WEAK_WAVE_ENERGY_SCALE
+                * WEAK_WAVE_ENERGY_SCALE * e2
+                / ((energy + WEAK_WAVE_ENERGY_SCALE)
+                * (e2 + WEAK_WAVE_FADE_SCALE
+                * WEAK_WAVE_FADE_SCALE));
+
+        return energy * Math.exp(
+                -AIR_ATTENUATION * distance / attenuationEnergy
+        );
+    }
+
+    private boolean tryMacroEmit(
+            int x, int y, int z,
+            int direction,
+            double energy,
+            double vx, double vy, double vz,
+            double arrival,
+            double coherence,
+            SnapshotManager snapshots
+    ) {
+        if (energy < MIN_MACRO_ENERGY
+                || !snapshots.getAirRegionIfReady(
+                x, y, z, macroRegion)
+                || macroRegion.size < 8) {
+            return false;
+        }
+
+        double sum = 0.0;
+        double meanX = 0.0, meanY = 0.0, meanZ = 0.0;
+        double secondX = 0.0, secondY = 0.0, secondZ = 0.0;
+        double meanLength = 0.0;
+
+        for (int i = 0; i < DIRECTIONS; i++) {
+            double dot = vx * UX[i]
+                    + vy * UY[i]
+                    + vz * UZ[i];
+
+            double w = ANGULAR_WEIGHT[LENGTH_CLASS[i]]
+                    * ((1.0 - coherence) / DIRECTIONS
+                    + (dot > 0.0
+                    ? coherence * Math.pow(dot, LOBE_POWER)
+                    : 0.0));
+
+            sum += w;
+
+            meanX += w * DX[i];
+            meanY += w * DY[i];
+            meanZ += w * DZ[i];
+
+            secondX += w * DX[i] * DX[i];
+            secondY += w * DY[i] * DY[i];
+            secondZ += w * DZ[i] * DZ[i];
+
+            meanLength += w * LENGTH[LENGTH_CLASS[i]];
+        }
+
+        if (sum <= 0.0) {
+            return false;
+        }
+
+        meanX /= sum;
+        meanY /= sum;
+        meanZ /= sum;
+        meanLength /= sum;
+
+        double varX = Math.max(0.0, secondX / sum - meanX * meanX);
+        double varY = Math.max(0.0, secondY / sum - meanY * meanY);
+        double varZ = Math.max(0.0, secondZ / sum - meanZ * meanZ);
+
+        int chosenHops = 0;
+
+        for (int hops = MAX_MACRO_HOPS;
+             hops >= MIN_MACRO_HOPS; hops--) {
+
+            int cx = x + (int) Math.round(hops * meanX);
+            int cy = y + (int) Math.round(hops * meanY);
+            int cz = z + (int) Math.round(hops * meanZ);
+
+            int rx = (int) Math.round(
+                    2.0 * Math.sqrt(hops * varX));
+            int ry = (int) Math.round(
+                    2.0 * Math.sqrt(hops * varY));
+            int rz = (int) Math.round(
+                    2.0 * Math.sqrt(hops * varZ));
+
+            boolean valid = true;
+
+            for (int j = 0; j < 7; j++) {
+                macroX[j] = cx
+                        + (j == 1 ? rx : j == 2 ? -rx : 0);
+                macroY[j] = cy
+                        + (j == 3 ? ry : j == 4 ? -ry : 0);
+                macroZ[j] = cz
+                        + (j == 5 ? rz : j == 6 ? -rz : 0);
+
+                if (macroX[j] <= macroRegion.x
+                        || macroY[j] <= macroRegion.y
+                        || macroZ[j] <= macroRegion.z
+                        || macroX[j] >= macroRegion.x + macroRegion.size - 1
+                        || macroY[j] >= macroRegion.y + macroRegion.size - 1
+                        || macroZ[j] >= macroRegion.z + macroRegion.size - 1) {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if (valid) {
+                chosenHops = hops;
+                break;
+            }
+        }
+
+        if (chosenHops == 0) {
+            return false;
+        }
+
+        // Воздушное затухание на пропущенных шагах.
+        double remaining = energy;
+
+        for (int i = 0; i < chosenHops; i++) {
+            double after = airAfterDistance(
+                    remaining, meanLength);
+
+            airAbsorbed += remaining - after;
+            remaining = after;
+
+            if (remaining < MIN_ACTIVE_ENERGY) {
+                culled += remaining;
+                return true;
+            }
+        }
+
+        double exitArrival =
+                arrival + chosenHops * meanLength;
+
+        // Консервативное распределение энергии по 7 точкам.
+        for (int j = 0; j < 7; j++) {
+            double fraction = j == 0 ? 0.25 : 0.125;
+            double e = remaining * fraction;
+
+            long target = pack(
+                    macroX[j], macroY[j], macroZ[j]);
+
+            // Виртуальный источник остаётся соседней клеткой.
+            long source = pack(
+                    macroX[j] - DX[direction],
+                    macroY[j] - DY[direction],
+                    macroZ[j] - DZ[direction]);
+
+            emitAt(
+                    source, target,
+                    e,
+                    e * vx,
+                    e * vy,
+                    e * vz,
+                    exitArrival
+            );
+        }
+
+        return true;
     }
 
 }
