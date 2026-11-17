@@ -60,7 +60,7 @@ public class explosionstep {
         return deferredLastStep;
     }
 
-    private static final int MIN_MACRO_HOPS = 6;
+    private static final int MIN_MACRO_HOPS = 2;
     private static final int MAX_MACRO_HOPS = 12;
     private static final double MIN_MACRO_ENERGY = 0.5;
     private static final double MIN_MACRO_COHERENCE = 0.94;
@@ -130,6 +130,32 @@ public class explosionstep {
 
     private static int unpackZ(long p) {
         return (int) (p << 38 >> 38);
+    }
+
+    private long macroAttemptsLastStep;
+    private long macroTransfersLastStep;
+    private long macroHopsLastStep;
+    private long macroEightLastStep;
+    private long macroSixteenLastStep;
+
+    public long getMacroAttemptsLastStep() {
+        return macroAttemptsLastStep;
+    }
+
+    public long getMacroTransfersLastStep() {
+        return macroTransfersLastStep;
+    }
+
+    public long getMacroHopsLastStep() {
+        return macroHopsLastStep;
+    }
+
+    public long getMacroEightLastStep() {
+        return macroEightLastStep;
+    }
+
+    public long getMacroSixteenLastStep() {
+        return macroSixteenLastStep;
     }
 
     private final Long2ObjectOpenHashMap<WaveBucket> waitingBySection =
@@ -752,12 +778,6 @@ public class explosionstep {
         double invWeight = 1.0 / totalWeight;
 
         // Затухание рассчитывается лишь для трёх расстояний.
-        double energySquared = available * available;
-
-        double attenuationEnergy = available
-                + WEAK_WAVE_ENERGY_SCALE * WEAK_WAVE_ENERGY_SCALE * energySquared
-                / ((available + WEAK_WAVE_ENERGY_SCALE)
-                * (energySquared + WEAK_WAVE_FADE_SCALE * WEAK_WAVE_FADE_SCALE));
 
         double axial = airAfterDistance(available, LENGTH[1]);
         double face = airAfterDistance(available, LENGTH[2]);
@@ -878,6 +898,12 @@ public class explosionstep {
 
         activateDistant();
 
+        macroAttemptsLastStep = 0;
+        macroTransfersLastStep = 0;
+        macroHopsLastStep = 0;
+        macroEightLastStep = 0;
+        macroSixteenLastStep = 0;
+
         deferredLastStep = 0;
         cellsLastStep = 0;
         prefetchedSections.clear();
@@ -886,7 +912,6 @@ public class explosionstep {
 
         prefetchPending(snapshots);
         // Запрашиваем секции до начала расчёта.
-        prefetchPending(snapshots);
 
         WaveBucket bucket = currentBucket();
 
@@ -1250,9 +1275,13 @@ public class explosionstep {
             double coherence,
             SnapshotManager snapshots
     ) {
-        if (energy < MIN_MACRO_ENERGY
-                || !snapshots.getAirRegionIfReady(
-                x, y, z, macroRegion)
+        if (energy < MIN_MACRO_ENERGY) {
+            return false;
+        }
+
+        macroAttemptsLastStep++;
+
+        if (!snapshots.getAirRegionIfReady(x, y, z, macroRegion)
                 || macroRegion.size < 8) {
             return false;
         }
@@ -1301,7 +1330,12 @@ public class explosionstep {
 
         int chosenHops = 0;
 
-        for (int hops = MAX_MACRO_HOPS;
+        int maxHops = Math.min(
+                MAX_MACRO_HOPS,
+                macroRegion.size - 2
+        );
+
+        for (int hops = maxHops;
              hops >= MIN_MACRO_HOPS; hops--) {
 
             int cx = x + (int) Math.round(hops * meanX);
@@ -1344,6 +1378,15 @@ public class explosionstep {
 
         if (chosenHops == 0) {
             return false;
+        }
+
+        macroTransfersLastStep++;
+        macroHopsLastStep += chosenHops;
+
+        if (macroRegion.size == 8) {
+            macroEightLastStep++;
+        } else if (macroRegion.size == 16) {
+            macroSixteenLastStep++;
         }
 
         // Воздушное затухание на пропущенных шагах.

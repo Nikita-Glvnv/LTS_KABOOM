@@ -107,6 +107,11 @@ public class DimensionWorker {
         long physicsDeferredCells = 0;
         long physicsDestroyedBlocks = 0;
         long physicsPrefetchChecks = 0;
+        long physicsMacroAttempts = 0;
+        long physicsMacroTransfers = 0;
+        long physicsMacroHops = 0;
+        long physicsMacroEight = 0;
+        long physicsMacroSixteen = 0;
 
         long physicsTimeNs = 0;
         long maxPhysicsStepNs = 0;
@@ -179,6 +184,12 @@ public class DimensionWorker {
 
                             physicsPrefetchChecks +=
                                     physics.getPrefetchedSectionsLastStep();
+
+                            physicsMacroAttempts += physics.getMacroAttemptsLastStep();
+                            physicsMacroTransfers += physics.getMacroTransfersLastStep();
+                            physicsMacroHops += physics.getMacroHopsLastStep();
+                            physicsMacroEight += physics.getMacroEightLastStep();
+                            physicsMacroSixteen += physics.getMacroSixteenLastStep();
                         }
 
                         if (finished) {
@@ -232,6 +243,8 @@ public class DimensionWorker {
                                         "waveTick={}, steps={}, processedCells={}, " +
                                         "deferredCells={}, maxCellsInStep={}, " +
                                         "destroyedBlocks={}, prefetchChecks={}, " +
+                                        "macroAttempts={}, macroTransfers={}, macroHops={}, " +
+                                        "macro8={}, macro16={}, " +
                                         "pendingCells={}, pendingDestroyBlocks={}, " +
                                         "pendingApply={}, physicsTimeUs={}, maxStepUs={}, " +
                                         "totalAbsorbed={}, totalAirAbsorbed={}, " +
@@ -246,6 +259,11 @@ public class DimensionWorker {
                                 maxPhysicsCells,
                                 physicsDestroyedBlocks,
                                 physicsPrefetchChecks,
+                                physicsMacroAttempts,
+                                physicsMacroTransfers,
+                                physicsMacroHops,
+                                physicsMacroEight,
+                                physicsMacroSixteen,
                                 physics.getPendingCellCount(),
                                 Math.max(
                                         0,
@@ -305,6 +323,11 @@ public class DimensionWorker {
                     physicsDeferredCells = 0;
                     physicsDestroyedBlocks = 0;
                     physicsPrefetchChecks = 0;
+                    physicsMacroAttempts = 0;
+                    physicsMacroTransfers = 0;
+                    physicsMacroHops = 0;
+                    physicsMacroEight = 0;
+                    physicsMacroSixteen = 0;
 
                     physicsTimeNs = 0;
                     maxPhysicsStepNs = 0;
