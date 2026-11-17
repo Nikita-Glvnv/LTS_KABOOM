@@ -63,18 +63,6 @@ public class explosionstep {
         return deferredLastStep;
     }
 
-    private static final int MIN_MACRO_HOPS = 2;
-    private static final int MAX_MACRO_HOPS = 12;
-    private static final double MIN_MACRO_ENERGY = 0.5;
-    private static final double MIN_MACRO_COHERENCE = 0.94;
-
-    private final oktoderevo.AirRegion macroRegion =
-            new oktoderevo.AirRegion();
-
-    private final int[] macroX = new int[7];
-    private final int[] macroY = new int[7];
-    private final int[] macroZ = new int[7];
-
     private final Long2ObjectOpenHashMap<WaveBucket> distantPending =
             new Long2ObjectOpenHashMap<>();
 
@@ -133,32 +121,6 @@ public class explosionstep {
 
     private static int unpackZ(long p) {
         return (int) (p << 38 >> 38);
-    }
-
-    private long macroAttemptsLastStep;
-    private long macroTransfersLastStep;
-    private long macroHopsLastStep;
-    private long macroEightLastStep;
-    private long macroSixteenLastStep;
-
-    public long getMacroAttemptsLastStep() {
-        return macroAttemptsLastStep;
-    }
-
-    public long getMacroTransfersLastStep() {
-        return macroTransfersLastStep;
-    }
-
-    public long getMacroHopsLastStep() {
-        return macroHopsLastStep;
-    }
-
-    public long getMacroEightLastStep() {
-        return macroEightLastStep;
-    }
-
-    public long getMacroSixteenLastStep() {
-        return macroSixteenLastStep;
     }
 
     private final Long2ObjectOpenHashMap<WaveBucket> waitingBySection =
@@ -977,19 +939,6 @@ public class explosionstep {
                 oy = (a * vy + bb * oy) * inv;
                 oz = (a * vz + bb * oz) * inv;
             }
-            if (k >= MIN_MACRO_COHERENCE
-                    && weight >= 0.03
-                    && tryMacroEmit(
-                    nx, ny, nz,
-                    i,
-                    transmitted,
-                    ox, oy, oz,
-                    meanArrival + LENGTH[cls],
-                    k,
-                    snapshots
-            )) {
-                continue;
-            }
 
             emit(
                     pos,
@@ -1014,12 +963,6 @@ public class explosionstep {
         }
 
         activateDistant();
-
-        macroAttemptsLastStep = 0;
-        macroTransfersLastStep = 0;
-        macroHopsLastStep = 0;
-        macroEightLastStep = 0;
-        macroSixteenLastStep = 0;
 
         deferredLastStep = 0;
         cellsLastStep = 0;
@@ -1361,184 +1304,6 @@ public class explosionstep {
         }
     }
 
-    private static double airAfterDistance(
-            double energy,
-            double distance
-    ) {
-        if (energy <= 0.0) {
-            return 0.0;
-        }
-
-        double attenuationEnergy = attenuationEnergy(energy);
-
-        return energy * Math.exp(
-                -AIR_ATTENUATION * distance / attenuationEnergy
-        );
-    }
-
-    private boolean tryMacroEmit(
-            int x, int y, int z,
-            int direction,
-            double energy,
-            double vx, double vy, double vz,
-            double arrival,
-            double coherence,
-            SnapshotManager snapshots
-    ) {
-        if (energy < MIN_MACRO_ENERGY) {
-            return false;
-        }
-
-        macroAttemptsLastStep++;
-
-        if (!snapshots.getAirRegionIfReady(x, y, z, macroRegion)
-                || macroRegion.size < 8) {
-            return false;
-        }
-
-        double sum = 0.0;
-        double meanX = 0.0, meanY = 0.0, meanZ = 0.0;
-        double secondX = 0.0, secondY = 0.0, secondZ = 0.0;
-        double meanLength = 0.0;
-
-        for (int i = 0; i < DIRECTIONS; i++) {
-            double dot = vx * UX[i]
-                    + vy * UY[i]
-                    + vz * UZ[i];
-
-            double w = ANGULAR_WEIGHT[LENGTH_CLASS[i]]
-                    * ((1.0 - coherence) / DIRECTIONS
-                    + (dot > 0.0
-                    ? coherence * Math.pow(dot, LOBE_POWER)
-                    : 0.0));
-
-            sum += w;
-
-            meanX += w * DX[i];
-            meanY += w * DY[i];
-            meanZ += w * DZ[i];
-
-            secondX += w * DX[i] * DX[i];
-            secondY += w * DY[i] * DY[i];
-            secondZ += w * DZ[i] * DZ[i];
-
-            meanLength += w * LENGTH[LENGTH_CLASS[i]];
-        }
-
-        if (sum <= 0.0) {
-            return false;
-        }
-
-        meanX /= sum;
-        meanY /= sum;
-        meanZ /= sum;
-        meanLength /= sum;
-
-        double varX = Math.max(0.0, secondX / sum - meanX * meanX);
-        double varY = Math.max(0.0, secondY / sum - meanY * meanY);
-        double varZ = Math.max(0.0, secondZ / sum - meanZ * meanZ);
-
-        int chosenHops = 0;
-
-        int maxHops = Math.min(
-                MAX_MACRO_HOPS,
-                macroRegion.size - 2
-        );
-
-        for (int hops = maxHops;
-             hops >= MIN_MACRO_HOPS; hops--) {
-
-            int cx = x + (int) Math.round(hops * meanX);
-            int cy = y + (int) Math.round(hops * meanY);
-            int cz = z + (int) Math.round(hops * meanZ);
-
-            int rx = macroRadius(hops * varX);
-            int ry = macroRadius(hops * varY);
-            int rz = macroRadius(hops * varZ);
-
-            if (cx - rx <= macroRegion.x
-                    || cx + rx >= macroRegion.x + macroRegion.size - 1
-                    || cy - ry <= macroRegion.y
-                    || cy + ry >= macroRegion.y + macroRegion.size - 1
-                    || cz - rz <= macroRegion.z
-                    || cz + rz >= macroRegion.z + macroRegion.size - 1) {
-                continue;
-            }
-
-            for (int j = 0; j < 7; j++) {
-                macroX[j] = cx
-                        + (j == 1 ? rx : j == 2 ? -rx : 0);
-
-                macroY[j] = cy
-                        + (j == 3 ? ry : j == 4 ? -ry : 0);
-
-                macroZ[j] = cz
-                        + (j == 5 ? rz : j == 6 ? -rz : 0);
-            }
-
-            chosenHops = hops;
-            break;
-        }
-
-        if (chosenHops == 0) {
-            return false;
-        }
-
-        macroTransfersLastStep++;
-        macroHopsLastStep += chosenHops;
-
-        if (macroRegion.size == 8) {
-            macroEightLastStep++;
-        } else if (macroRegion.size == 16) {
-            macroSixteenLastStep++;
-        }
-
-        // Воздушное затухание на пропущенных шагах.
-        double remaining = energy;
-
-        for (int i = 0; i < chosenHops; i++) {
-            double after = airAfterDistance(
-                    remaining, meanLength);
-
-            airAbsorbed += remaining - after;
-            remaining = after;
-
-            if (remaining < MIN_ACTIVE_ENERGY) {
-                culled += remaining;
-                return true;
-            }
-        }
-
-        double exitArrival =
-                arrival + chosenHops * meanLength;
-
-        // Консервативное распределение энергии по 7 точкам.
-        for (int j = 0; j < 7; j++) {
-            double fraction = j == 0 ? 0.25 : 0.125;
-            double e = remaining * fraction;
-
-            long target = pack(
-                    macroX[j], macroY[j], macroZ[j]);
-
-            // Виртуальный источник остаётся соседней клеткой.
-            long source = pack(
-                    macroX[j] - DX[direction],
-                    macroY[j] - DY[direction],
-                    macroZ[j] - DZ[direction]);
-
-            emitAt(
-                    source, target,
-                    e,
-                    e * vx,
-                    e * vy,
-                    e * vz,
-                    exitArrival
-            );
-        }
-
-        return true;
-    }
-
     private boolean isCachedAir(int x, int y, int z) {
         int size = cachedAirRegion.size;
 
@@ -1561,17 +1326,6 @@ public class explosionstep {
                 && y < cachedAirRegion.y + size - 1
                 && z > cachedAirRegion.z
                 && z < cachedAirRegion.z + size - 1;
-    }
-
-    private static int macroRadius(double value) {
-        if (value >= 10.5625) return 7;
-        if (value >= 7.5625) return 6;
-        if (value >= 5.0625) return 5;
-        if (value >= 3.0625) return 4;
-        if (value >= 1.5625) return 3;
-        if (value >= 0.5625) return 2;
-        if (value >= 0.0625) return 1;
-        return 0;
     }
 
     private static double attenuationEnergy(double energy) {
