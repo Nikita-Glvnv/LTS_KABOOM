@@ -42,6 +42,9 @@ public class explosionstep {
 
     private static final int MAX_PREFETCH_SECTIONS_PER_STEP = 64;
 
+    private final oktoderevo.AirRegion cachedAirRegion =
+            new oktoderevo.AirRegion();
+
     private static final double[] ANGULAR_WEIGHT = {
             0.0,
             1.0 / 21.0,
@@ -423,8 +426,23 @@ public class explosionstep {
 
     private boolean loadAxisResistance(
             int x, int y, int z,
+            boolean wall,
             SnapshotManager snapshots
-    ) {
+    ){
+        // Ищем воздушную область только для нетвёрдых клеток.
+        if (!wall && !isCachedAir(x, y, z)) {
+            if (!snapshots.getAirRegionIfReady(
+                    x, y, z, cachedAirRegion
+            )) {
+                cachedAirRegion.size = 0;
+            }
+        }
+
+// Все шесть соседей гарантированно воздушные.
+        if (isAirInterior(x, y, z)) {
+            Arrays.fill(axisResistance, 0.0);
+            return true;
+        }
         for (int i = 0; i < 6; i++) {
 
             int ax = x + AX[i];
@@ -435,6 +453,12 @@ public class explosionstep {
                     || ax < -30000000 || ax > 30000000
                     || az < -30000000 || az > 30000000) {
 
+                axisResistance[i] = 0.0;
+                continue;
+            }
+
+            // Сосед уже находится в известной воздушной области.
+            if (isCachedAir(ax, ay, az)) {
                 axisResistance[i] = 0.0;
                 continue;
             }
@@ -493,6 +517,7 @@ public class explosionstep {
 
         currentBucket().clear();
         solidCache.clear();
+        cachedAirRegion.size = 0;
         materialResistanceCache.clear();
         nextCell = 0;
         currentTick++;
@@ -618,7 +643,8 @@ public class explosionstep {
         double h = 0.0;
         double resistance = 0.0;
 
-        if (solidCache.get(pos) == 0) {
+        if (isCachedAir(x, y, z)
+                || solidCache.get(pos) == 0) {
             wall = false;
         } else {
             if (!snapshots.getBlock(x, y, z, block)) {
@@ -679,15 +705,11 @@ public class explosionstep {
                     int dy = y - sy;
                     int dz = z - sz;
 
-                    double returnDistance = Math.sqrt(
-                            (double) dx * dx +
-                                    (double) dy * dy +
-                                    (double) dz * dz
-                    );
+                    int distanceSquared =
+                            dx * dx + dy * dy + dz * dz;
 
-                    if (returnDistance < 1.0) {
-                        returnDistance = 1.0;
-                    }
+                    double returnDistance =
+                            LENGTH[Math.max(1, distanceSquared)];
 
                     emit(
                             src,
@@ -708,8 +730,7 @@ public class explosionstep {
         double available = incident - spent;
 
         if (available > 0.0
-                && !loadAxisResistance(x, y, z, snapshots)) {
-
+                && !loadAxisResistance(x, y, z, wall, snapshots)) {
             return false;
         }
 
@@ -779,9 +800,16 @@ public class explosionstep {
 
         // Затухание рассчитывается лишь для трёх расстояний.
 
-        double axial = airAfterDistance(available, LENGTH[1]);
-        double face = airAfterDistance(available, LENGTH[2]);
-        double space = airAfterDistance(available, LENGTH[3]);
+        double attenuation = attenuationEnergy(available);
+
+        double axial = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[1] / attenuation);
+
+        double face = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[2] / attenuation);
+
+        double space = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[3] / attenuation);
 
         // Распространение энергии.
         for (int i = 0; i < DIRECTIONS; i++) {
@@ -793,11 +821,10 @@ public class explosionstep {
             }
 
             int cls = LENGTH_CLASS[i];
+            double air = cls == 1 ? axial
+                    : cls == 2 ? face : space;
 
-            double afterAir = weight * (
-                    cls == 1 ? axial
-                            : cls == 2 ? face : space
-            );
+            double afterAir = weight * air;
 
             airAbsorbed += weight * available - afterAir;
 
@@ -813,7 +840,7 @@ public class explosionstep {
                 transmitted = 0.0;
             } else {
                 transmitted = afterAir * Math.exp(
-                        -weight * extraResistance / afterAir
+                        -extraResistance / air
                 );
             }
 
@@ -1254,12 +1281,7 @@ public class explosionstep {
 
         double e2 = energy * energy;
 
-        double attenuationEnergy = energy
-                + WEAK_WAVE_ENERGY_SCALE
-                * WEAK_WAVE_ENERGY_SCALE * e2
-                / ((energy + WEAK_WAVE_ENERGY_SCALE)
-                * (e2 + WEAK_WAVE_FADE_SCALE
-                * WEAK_WAVE_FADE_SCALE));
+        double attenuationEnergy = attenuationEnergy(energy);
 
         return energy * Math.exp(
                 -AIR_ATTENUATION * distance / attenuationEnergy
@@ -1342,38 +1364,32 @@ public class explosionstep {
             int cy = y + (int) Math.round(hops * meanY);
             int cz = z + (int) Math.round(hops * meanZ);
 
-            int rx = (int) Math.round(
-                    2.0 * Math.sqrt(hops * varX));
-            int ry = (int) Math.round(
-                    2.0 * Math.sqrt(hops * varY));
-            int rz = (int) Math.round(
-                    2.0 * Math.sqrt(hops * varZ));
+            int rx = macroRadius(hops * varX);
+            int ry = macroRadius(hops * varY);
+            int rz = macroRadius(hops * varZ);
 
-            boolean valid = true;
+            if (cx - rx <= macroRegion.x
+                    || cx + rx >= macroRegion.x + macroRegion.size - 1
+                    || cy - ry <= macroRegion.y
+                    || cy + ry >= macroRegion.y + macroRegion.size - 1
+                    || cz - rz <= macroRegion.z
+                    || cz + rz >= macroRegion.z + macroRegion.size - 1) {
+                continue;
+            }
 
             for (int j = 0; j < 7; j++) {
                 macroX[j] = cx
                         + (j == 1 ? rx : j == 2 ? -rx : 0);
+
                 macroY[j] = cy
                         + (j == 3 ? ry : j == 4 ? -ry : 0);
+
                 macroZ[j] = cz
                         + (j == 5 ? rz : j == 6 ? -rz : 0);
-
-                if (macroX[j] <= macroRegion.x
-                        || macroY[j] <= macroRegion.y
-                        || macroZ[j] <= macroRegion.z
-                        || macroX[j] >= macroRegion.x + macroRegion.size - 1
-                        || macroY[j] >= macroRegion.y + macroRegion.size - 1
-                        || macroZ[j] >= macroRegion.z + macroRegion.size - 1) {
-                    valid = false;
-                    break;
-                }
             }
 
-            if (valid) {
-                chosenHops = hops;
-                break;
-            }
+            chosenHops = hops;
+            break;
         }
 
         if (chosenHops == 0) {
@@ -1435,4 +1451,49 @@ public class explosionstep {
         return true;
     }
 
+    private boolean isCachedAir(int x, int y, int z) {
+        int size = cachedAirRegion.size;
+
+        return size > 0
+                && x >= cachedAirRegion.x
+                && x < cachedAirRegion.x + size
+                && y >= cachedAirRegion.y
+                && y < cachedAirRegion.y + size
+                && z >= cachedAirRegion.z
+                && z < cachedAirRegion.z + size;
+    }
+
+    private boolean isAirInterior(int x, int y, int z) {
+        int size = cachedAirRegion.size;
+
+        return size >= 3
+                && x > cachedAirRegion.x
+                && x < cachedAirRegion.x + size - 1
+                && y > cachedAirRegion.y
+                && y < cachedAirRegion.y + size - 1
+                && z > cachedAirRegion.z
+                && z < cachedAirRegion.z + size - 1;
+    }
+
+    private static int macroRadius(double value) {
+        if (value >= 10.5625) return 7;
+        if (value >= 7.5625) return 6;
+        if (value >= 5.0625) return 5;
+        if (value >= 3.0625) return 4;
+        if (value >= 1.5625) return 3;
+        if (value >= 0.5625) return 2;
+        if (value >= 0.0625) return 1;
+        return 0;
+    }
+
+    private static double attenuationEnergy(double energy) {
+        double e2 = energy * energy;
+
+        return energy
+                + WEAK_WAVE_ENERGY_SCALE
+                * WEAK_WAVE_ENERGY_SCALE * e2
+                / ((energy + WEAK_WAVE_ENERGY_SCALE)
+                * (e2 + WEAK_WAVE_FADE_SCALE
+                * WEAK_WAVE_FADE_SCALE));
+    }
 }
