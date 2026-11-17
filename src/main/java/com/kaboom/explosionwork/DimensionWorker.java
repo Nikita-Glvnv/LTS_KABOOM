@@ -20,7 +20,7 @@ public class DimensionWorker {
     private boolean pendingDestroyApply;
     private int nextDestroyedToApply;
 
-    private static final int MAX_SNAPSHOTS_PER_TICK = 4;
+    private static final int MAX_SNAPSHOTS_PER_TICK = 32;
     private static final long TICK_NANOS = 50_000_000L;
     private static final int MAX_EXPLOSIONS_PER_TICK = 64;
 

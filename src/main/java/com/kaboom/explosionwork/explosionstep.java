@@ -739,11 +739,17 @@ public class explosionstep {
 // на диагональном участке траектории.
             double extraResistance = diagonalResistance(i);
 
-            double transmitted = extraResistance == 0.0
-                    ? afterAir
-                    : afterAir * (
-                    available / (available + extraResistance)
-            );
+            double transmitted;
+
+            if (extraResistance == 0.0) {
+                transmitted = afterAir;
+            } else if (afterAir <= 0.0) {
+                transmitted = 0.0;
+            } else {
+                transmitted = afterAir * Math.exp(
+                        -weight * extraResistance / afterAir
+                );
+            }
 
 // Потери на прохождение промежуточного материала.
             absorbed += afterAir - transmitted;
