@@ -699,4 +699,23 @@ public class SnapshotManager {
                     && changes.chunkZ == chunkZ;
         });
     }
+
+    public boolean isSectionReady(int x, int y, int z) {
+        if (y < 0 || y >= 256) {
+            return false;
+        }
+
+        long key = ChunkPos.asLong(x >> 4, z >> 4);
+
+        if (inactiveSince.containsKey(key)) {
+            return false;
+        }
+
+        StoredChunk chunk = chunks.get(key);
+        int sectionY = y >> 4;
+
+        return chunk != null
+                && (chunk.readyMask & (1 << sectionY)) != 0
+                && chunk.sections[sectionY] != null;
+    }
 }

@@ -6,6 +6,8 @@ import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -113,6 +115,27 @@ public class explosionstep {
 
     private static int unpackZ(long p) {
         return (int) (p << 38 >> 38);
+    }
+
+    private final Long2ObjectOpenHashMap<WaveBucket> waitingBySection =
+            new Long2ObjectOpenHashMap<>();
+
+    private long missingSectionKey;
+    private int waitingCellCount;
+    private long lastWaitingRefreshNanos;
+
+    private int cellsLastStep;
+
+    public int getCellsLastStep() {
+        return cellsLastStep;
+    }
+
+    public int getWaitingCellCount() {
+        return waitingCellCount;
+    }
+
+    public int getWaitingSectionCount() {
+        return waitingBySection.size();
     }
 
     private static boolean blocked(int direction, int solidMask) {
@@ -382,6 +405,11 @@ public class explosionstep {
             if (Float.isNaN(resistance)) {
 
                 if (!snapshots.getBlock(ax, ay, az, block)) {
+                    missingSectionKey = pack(
+                            ax >> 4,
+                            ay >> 4,
+                            az >> 4
+                    );
                     return false;
                 }
 
@@ -430,7 +458,9 @@ public class explosionstep {
     }
 
     public boolean hasPending() {
-
+        if (!waitingBySection.isEmpty()) {
+            return true;
+        }
         for (WaveBucket bucket : pending) {
             if (bucket.cellCount != 0) {
                 return true;
@@ -547,6 +577,11 @@ public class explosionstep {
             wall = false;
         } else {
             if (!snapshots.getBlock(x, y, z, block)) {
+                missingSectionKey = pack(
+                        x >> 4,
+                        y >> 4,
+                        z >> 4
+                );
                 return false;
             }
 
@@ -818,8 +853,12 @@ public class explosionstep {
         }
 
         deferredLastStep = 0;
+        cellsLastStep = 0;
         prefetchedSections.clear();
 
+        resumeWaitingCells(snapshots);
+
+        prefetchPending(snapshots);
         // Запрашиваем секции до начала расчёта.
         prefetchPending(snapshots);
 
@@ -831,14 +870,14 @@ public class explosionstep {
 
                 // Отсутствует снимок: откладываем только
                 // эту клетку, продолжая остальные.
-                deferCell(bucket, nextCell);
+                parkCell(bucket, nextCell);
 
                 deferredLastStep++;
             }
 
             nextCell++;
         }
-
+        cellsLastStep = bucket.cellCount;
         finishTick();
 
         // Запрашиваем секции для новых передач,
@@ -918,38 +957,42 @@ public class explosionstep {
         }
     }
 
-    private void deferCell(WaveBucket bucket, int cell) {
+    private void parkCell(WaveBucket source, int cell) {
+        WaveBucket waiting = waitingBySection.get(missingSectionKey);
 
-        WaveBucket next = pending[
-                (int) ((currentTick + 1) % RING_SIZE)
-                ];
+        if (waiting == null) {
+            waiting = new WaveBucket();
+            waitingBySection.put(missingSectionKey, waiting);
+        }
 
-        long target = bucket.position[cell];
+        long target = source.position[cell];
+        int previousCount = waiting.cellCount;
 
-        // Переносим все входящие передачи по отдельности.
-        for (int link = bucket.firstLink[cell];
+        for (int link = source.firstLink[cell];
              link != -1;
-             link = bucket.nextLink[link]) {
+             link = source.nextLink[link]) {
 
-            double energy = bucket.linkEnergy[link];
+            double energy = source.linkEnergy[link];
 
             if (energy <= 0.0) {
                 continue;
             }
 
-            double arrival =
-                    bucket.linkArrivalSum[link] / energy + 1.0;
+            double relativeArrival =
+                    source.linkArrivalSum[link] / energy - currentTick;
 
-            next.add(
-                    bucket.linkSource[link],
+            waiting.add(
+                    source.linkSource[link],
                     target,
                     energy,
-                    bucket.linkMomentX[link],
-                    bucket.linkMomentY[link],
-                    bucket.linkMomentZ[link],
-                    arrival
+                    source.linkMomentX[link],
+                    source.linkMomentY[link],
+                    source.linkMomentZ[link],
+                    relativeArrival
             );
         }
+
+        waitingCellCount += waiting.cellCount - previousCount;
     }
 
     public int getPrefetchedSectionsLastStep() {
@@ -957,7 +1000,7 @@ public class explosionstep {
     }
 
     public int getPendingCellCount() {
-        int count = 0;
+        int count = waitingCellCount;
 
         for (WaveBucket bucket : pending) {
             count += bucket.cellCount;
@@ -997,6 +1040,78 @@ public class explosionstep {
         double averageResistance = resistance / axes;
 
         return averageResistance * (LENGTH[axes] - 1.0);
+    }
+
+    private void resumeWaitingCells(SnapshotManager snapshots) {
+        if (waitingBySection.isEmpty()) {
+            return;
+        }
+
+        long now = System.nanoTime();
+
+        boolean refresh = lastWaitingRefreshNanos == 0
+                || now - lastWaitingRefreshNanos >= 1_000_000_000L;
+
+        if (refresh) {
+            lastWaitingRefreshNanos = now;
+        }
+
+        LongArrayList readySections = new LongArrayList();
+
+        for (Long2ObjectMap.Entry<WaveBucket> entry
+                : waitingBySection.long2ObjectEntrySet()) {
+
+            long key = entry.getLongKey();
+
+            int x = unpackX(key) << 4;
+            int y = unpackY(key) << 4;
+            int z = unpackZ(key) << 4;
+
+            if (snapshots.isSectionReady(x, y, z)) {
+                readySections.add(key);
+            } else if (refresh) {
+                snapshots.ensureSectionTracked(x, y, z);
+            }
+        }
+
+        WaveBucket active = currentBucket();
+
+        for (int i = 0; i < readySections.size(); i++) {
+            long key = readySections.getLong(i);
+            WaveBucket waiting = waitingBySection.remove(key);
+
+            if (waiting == null) {
+                continue;
+            }
+
+            waitingCellCount -= waiting.cellCount;
+
+            for (int c = 0; c < waiting.cellCount; c++) {
+                long target = waiting.position[c];
+
+                for (int link = waiting.firstLink[c];
+                     link != -1;
+                     link = waiting.nextLink[link]) {
+
+                    double energy = waiting.linkEnergy[link];
+
+                    if (energy <= 0.0) {
+                        continue;
+                    }
+
+                    active.add(
+                            waiting.linkSource[link],
+                            target,
+                            energy,
+                            waiting.linkMomentX[link],
+                            waiting.linkMomentY[link],
+                            waiting.linkMomentZ[link],
+                            currentTick
+                                    + waiting.linkArrivalSum[link] / energy
+                    );
+                }
+            }
+        }
     }
 
 }

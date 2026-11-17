@@ -157,8 +157,6 @@ public class DimensionWorker {
 
                         stage = "physics";
 
-                        int activeCells = physics.currentBucket().cellCount;
-
                         long physicsStart = System.nanoTime();
 
                         boolean finished =
@@ -182,6 +180,8 @@ public class DimensionWorker {
                         }
 
                         if (finished) {
+                            int activeCells = physics.getCellsLastStep();
+                            maxPhysicsCells = Math.max(maxPhysicsCells, activeCells);
 
                             // Шаг завершён. Передаём его разрушения.
                             pendingDestroyApply = true;
