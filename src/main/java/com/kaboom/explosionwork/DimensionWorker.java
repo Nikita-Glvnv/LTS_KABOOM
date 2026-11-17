@@ -162,6 +162,8 @@ public class DimensionWorker {
                         boolean finished =
                                 physics.step(snapshotManager);
 
+                        int activeCells = physics.getCellsLastStep();
+
                         long duration = System.nanoTime() - physicsStart;
 
                         physicsTimeNs += duration;
@@ -180,8 +182,6 @@ public class DimensionWorker {
                         }
 
                         if (finished) {
-                            int activeCells = physics.getCellsLastStep();
-                            maxPhysicsCells = Math.max(maxPhysicsCells, activeCells);
 
                             // Шаг завершён. Передаём его разрушения.
                             pendingDestroyApply = true;
