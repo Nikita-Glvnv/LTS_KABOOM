@@ -8,6 +8,10 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import java.util.ArrayDeque;
+
+import it.unimi.dsi.fastutil.ints.Int2IntMap;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -176,8 +180,18 @@ public class explosionstep {
         private static final int DIRECT_INDEX_THRESHOLD = 6;
         private static final int SOURCE_SLOTS = 27;
 
-        private final Long2IntOpenHashMap cellIndex =
-                new Long2IntOpenHashMap();
+        private static final int DENSE_THRESHOLD = 256;
+        private static final int MAX_REUSED_SECTIONS = 128;
+
+        private final Long2ObjectOpenHashMap<SectionCells> sections =
+                new Long2ObjectOpenHashMap<>();
+
+        private final ArrayDeque<SectionCells> reusableSections =
+                new ArrayDeque<>();
+
+        // Кеш последней секции для последовательных обращений.
+        private long cachedSectionKey;
+        private SectionCells cachedSection;
 
         int cellCount;
         int linkCount;
@@ -210,20 +224,118 @@ public class explosionstep {
         // Связь передач, приходящих в одну клетку.
         int[] nextLink = new int[128];
 
-        WaveBucket() {
-            cellIndex.defaultReturnValue(-1);
+        private static final class SectionCells {
+
+            private final Int2IntOpenHashMap sparse =
+                    new Int2IntOpenHashMap();
+
+            private int[] dense;
+            private int sparseCount;
+
+            SectionCells() {
+                sparse.defaultReturnValue(0);
+            }
+
+            int get(int localIndex) {
+                return dense != null
+                        ? dense[localIndex]
+                        : sparse.get(localIndex);
+            }
+
+            void put(int localIndex, int cellIndex) {
+
+                if (dense != null) {
+                    dense[localIndex] = cellIndex;
+                    return;
+                }
+
+                sparse.put(localIndex, cellIndex);
+                sparseCount++;
+
+                // Переключаемся на прямую индексацию.
+                if (sparseCount >= DENSE_THRESHOLD) {
+
+                    dense = new int[4096];
+
+                    for (Int2IntMap.Entry entry
+                            : sparse.int2IntEntrySet()) {
+
+                        dense[entry.getIntKey()] =
+                                entry.getIntValue();
+                    }
+
+                    sparse.clear();
+                }
+            }
+
+            void reset() {
+                sparseCount = 0;
+
+                if (dense != null) {
+                    Arrays.fill(dense, 0);
+                } else {
+                    sparse.clear();
+                }
+            }
         }
 
         void add(long source, long target, double e,
                  double mx, double my, double mz, double arrival) {
 
-            int c = cellIndex.get(target);
+            int x = unpackX(target);
+            int y = unpackY(target);
+            int z = unpackZ(target);
+
+// Координаты секции.
+            long sectionKey = pack(
+                    x >> 4,
+                    y >> 4,
+                    z >> 4
+            );
+
+// Индекс блока внутри секции 16×16×16.
+            int localIndex =
+                    ((y & 15) << 8)
+                            | ((z & 15) << 4)
+                            | (x & 15);
+
+// Получаем индекс секции.
+            SectionCells section;
+
+            if (cachedSection != null
+                    && cachedSectionKey == sectionKey) {
+
+                section = cachedSection;
+
+            } else {
+
+                section = sections.get(sectionKey);
+
+                if (section == null) {
+
+                    section = reusableSections.pollFirst();
+
+                    if (section == null) {
+                        section = new SectionCells();
+                    }
+
+                    sections.put(sectionKey, section);
+                }
+
+                cachedSectionKey = sectionKey;
+                cachedSection = section;
+            }
+
+// Индекс клетки, 0 означает отсутствие.
+            int c = section.get(localIndex) - 1;
 
             if (c == -1) {
+
                 growCells();
 
                 c = cellCount++;
-                cellIndex.put(target, c);
+
+                section.put(localIndex, c + 1);
 
                 position[c] = target;
 
@@ -358,7 +470,21 @@ public class explosionstep {
 
         void clear() {
 
-            cellIndex.clear();
+            // Возвращаем индексы секций в пул.
+            for (SectionCells section : sections.values()) {
+
+                if (reusableSections.size() < MAX_REUSED_SECTIONS) {
+
+                    section.reset();
+                    reusableSections.addLast(section);
+                }
+            }
+
+            sections.clear();
+
+// Сбрасываем кеш последней секции.
+            cachedSection = null;
+            cachedSectionKey = 0L;
 
             cellCount = 0;
             linkCount = 0;
@@ -475,12 +601,12 @@ public class explosionstep {
                 energy, mx, my, mz, arrival
         );
     }
-
     private boolean loadAxisResistance(
             int x, int y, int z,
             boolean wall,
+            int axisMask,
             SnapshotManager snapshots
-    ){
+    ) {
         // Ищем воздушную область только для нетвёрдых клеток.
         if (!wall && !isCachedAir(x, y, z)) {
             if (!snapshots.getAirRegionIfReady(
@@ -496,6 +622,9 @@ public class explosionstep {
             return true;
         }
         for (int i = 0; i < 6; i++) {
+            if ((axisMask & (1 << i)) == 0) {
+                continue;
+            }
 
             int ax = x + AX[i];
             int ay = y + AY[i];
@@ -781,20 +910,31 @@ public class explosionstep {
         // Блок либо отсутствует, либо будет разрушен.
         double available = incident - spent;
 
-        if (available > 0.0
-                && !loadAxisResistance(x, y, z, wall, snapshots)) {
-            return false;
-        }
-
-        if (wall) {
-            absorbed += spent;
-
-            // Только регистрируем разрушение.
-            // Состояние материала текущего тика не меняем.
-            destroyed.add(pos);
-        }
-
         if (available <= 0.0) {
+            if (wall) {
+                absorbed += spent;
+                destroyed.add(pos);
+            }
+            return true;
+        }
+
+// Затухание на минимальном расстоянии.
+        double attenuation = attenuationEnergy(available);
+
+        double axial = available * Math.exp(
+                -AIR_ATTENUATION * LENGTH[1] / attenuation
+        );
+
+// Даже максимальная возможная передача
+// не достигает минимальной активной энергии.
+        if (axial < MIN_ACTIVE_ENERGY) {
+
+            if (wall) {
+                absorbed += spent;
+                destroyed.add(pos);
+            }
+
+            culled += available;
             return true;
         }
 
@@ -843,6 +983,11 @@ public class explosionstep {
         }
 
         if (totalWeight <= 0.0) {
+            if (wall) {
+                absorbed += spent;
+                destroyed.add(pos);
+            }
+
             absorbed += available;
             return true;
         }
@@ -852,16 +997,70 @@ public class explosionstep {
 
         // Затухание рассчитывается лишь для трёх расстояний.
 
-        double attenuation = attenuationEnergy(available);
-
-        double axial = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[1] / attenuation);
-
         double face = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[2] / attenuation);
+                -AIR_ATTENUATION * LENGTH[2] / attenuation
+        );
 
         double space = available * Math.exp(
-                -AIR_ATTENUATION * LENGTH[3] / attenuation);
+                -AIR_ATTENUATION * LENGTH[3] / attenuation
+        );
+
+// Определяем, сопротивления каких соседей
+// действительно понадобятся.
+        int axisMask = 0;
+
+        for (int i = 0; i < DIRECTIONS; i++) {
+
+            int cls = LENGTH_CLASS[i];
+
+            // Осевые направления не требуют
+            // дополнительного сопротивления.
+            if (cls == 1) {
+                continue;
+            }
+
+            double weight = weights[i] * invWeight;
+
+            if (weight <= 0.0) {
+                continue;
+            }
+
+            double air = cls == 2 ? face : space;
+            double afterAir = weight * air;
+
+            // Направление гарантированно не создаст
+            // активную передачу.
+            if (afterAir < MIN_ACTIVE_ENERGY) {
+                continue;
+            }
+
+            if (DX[i] != 0) {
+                axisMask |= DX[i] > 0 ? 1 : 2;
+            }
+
+            if (DY[i] != 0) {
+                axisMask |= DY[i] > 0 ? 4 : 8;
+            }
+
+            if (DZ[i] != 0) {
+                axisMask |= DZ[i] > 0 ? 16 : 32;
+            }
+        }
+
+// Загружаем только необходимые сопротивления.
+// При отсутствии снимка откладываем всю клетку,
+// прежде чем она создаст какие-либо передачи.
+        if (axisMask != 0
+                && !loadAxisResistance(
+                x, y, z, wall, axisMask, snapshots
+        )) {
+            return false;
+        }
+
+        if (wall) {
+            absorbed += spent;
+            destroyed.add(pos);
+        }
 
         // Распространение энергии.
         for (int i = 0; i < DIRECTIONS; i++) {
@@ -879,6 +1078,13 @@ public class explosionstep {
             double afterAir = weight * air;
 
             airAbsorbed += weight * available - afterAir;
+
+            // После затухания в воздухе энергии уже
+// недостаточно для создания передачи.
+            if (afterAir < MIN_ACTIVE_ENERGY) {
+                culled += afterAir;
+                continue;
+            }
 
 // Дополнительное сопротивление материала
 // на диагональном участке траектории.
