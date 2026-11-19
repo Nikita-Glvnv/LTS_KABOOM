@@ -10,6 +10,8 @@ import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.event.world.WorldEvent;
+import net.minecraftforge.fluids.FluidRegistry;
+import net.minecraftforge.fluids.IFluidBlock;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraft.entity.Entity;
@@ -505,12 +507,12 @@ public class chunksnapshot {
                             baseZ + z
                     );
 
-                    if (block.isAir(state, world, pos)) {
+                    if (isLiquidBlock(state)) {
+                        types[index] = oktoderevo.LIQUID;
                         continue;
                     }
 
-                    if (state.getMaterial().isLiquid()) {
-                        types[index] = oktoderevo.LIQUID;
+                    if (block.isAir(state, world, pos)) {
                         continue;
                     }
 
@@ -808,6 +810,14 @@ public class chunksnapshot {
 
     public void resetDimension(int dimensionId) {
         unregisterDimension(dimensionId);
+    }
+
+    static boolean isLiquidBlock(IBlockState state) {
+        Block block = state.getBlock();
+
+        return state.getMaterial().isLiquid()
+                || block instanceof IFluidBlock
+                || FluidRegistry.lookupFluidForBlock(block) != null;
     }
 
     boolean offerUpdate(SnapshotUpdate update) {

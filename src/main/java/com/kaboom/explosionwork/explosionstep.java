@@ -23,6 +23,10 @@ public class explosionstep {
     private static final double MAX_REFLECTION = 0.40;
     private static final double HARDNESS_SCALE = 5.0;
     private static final double DESTRUCTION_MULTIPLIER = 1.0;
+    private static final double LIQUID_MIN_ABSORPTION = 1.0;
+    private static final double LIQUID_ABSORPTION_FRACTION = 0.20;
+    private static final double LIQUID_DESTRUCTION_THRESHOLD = 100.0;
+    private static final double LIQUID_DIRECTION_FACTOR = 0.5;
 
     private static final int DIRECTIONS = 26;
 
@@ -703,7 +707,7 @@ public class explosionstep {
 
                 boolean solid = block.type == oktoderevo.BLOCK;
 
-                solidCache.put(pos, (byte) (solid ? 1 : 0));
+                cellTypeCache.put(pos, block.type);
 
                 if (!solid) {
                     resistance = 0.0f;
@@ -922,13 +926,26 @@ public class explosionstep {
         }
 
         boolean wall;
+        boolean liquid;
+
         double h = 0.0;
         double resistance = 0.0;
 
+        byte cachedType = cellTypeCache.get(pos);
+
         if (isCachedAir(x, y, z)
-                || solidCache.get(pos) == 0) {
+                || cachedType == oktoderevo.AIR) {
+
             wall = false;
+            liquid = false;
+
+        } else if (cachedType == oktoderevo.LIQUID) {
+
+            wall = false;
+            liquid = true;
+
         } else {
+
             if (!snapshots.getBlock(x, y, z, block)) {
                 missingSectionKey = pack(
                         x >> 4,
@@ -939,15 +956,15 @@ public class explosionstep {
             }
 
             wall = block.type == oktoderevo.BLOCK;
-            solidCache.put(pos, (byte) (wall ? 1 : 0));
+            liquid = block.type == oktoderevo.LIQUID;
+
+            cellTypeCache.put(pos, block.type);
 
             if (wall) {
                 h = block.hardness;
                 resistance = block.resistance;
             }
         }
-
-        double reflect = 0.0;
         double spent = 0.0;
 
         // Взаимодействие с твёрдым блоком.
@@ -1008,14 +1025,36 @@ public class explosionstep {
             }
         }
 
+        boolean liquidDestroyed = false;
+
+        if (liquid) {
+
+            double absorption = Math.min(
+                    incident,
+                    LIQUID_MIN_ABSORPTION
+                            + incident * LIQUID_ABSORPTION_FRACTION
+            );
+
+            if (absorption > LIQUID_DESTRUCTION_THRESHOLD) {
+
+                liquidDestroyed = true;
+                spent = LIQUID_DESTRUCTION_THRESHOLD;
+
+            } else {
+
+                spent = absorption;
+            }
+        }
+
         // Блок либо отсутствует, либо будет разрушен.
         double available = incident - spent;
 
         if (available <= 0.0) {
-            if (wall) {
-                absorbed += spent;
-                destroyed.add(pos);
-            }
+            recordMaterialInteraction(
+                    pos,
+                    spent,
+                    wall || liquidDestroyed
+            );
             return true;
         }
 
@@ -1030,10 +1069,11 @@ public class explosionstep {
 // не достигает минимальной активной энергии.
         if (axial < MIN_ACTIVE_ENERGY) {
 
-            if (wall) {
-                absorbed += spent;
-                destroyed.add(pos);
-            }
+            recordMaterialInteraction(
+                    pos,
+                    spent,
+                    wall || liquidDestroyed
+            );
 
             culled += available;
             return true;
@@ -1049,6 +1089,10 @@ public class explosionstep {
         );
 
         double k = Math.min(1.0, momentLength / incident);
+
+        if (liquid && !liquidDestroyed) {
+            k *= LIQUID_DIRECTION_FACTOR;
+        }
 
         double vx = momentLength > 1e-15
                 ? px / momentLength : 0.0;
@@ -1084,10 +1128,11 @@ public class explosionstep {
         }
 
         if (totalWeight <= 0.0) {
-            if (wall) {
-                absorbed += spent;
-                destroyed.add(pos);
-            }
+            recordMaterialInteraction(
+                    pos,
+                    spent,
+                    wall || liquidDestroyed
+            );
 
             absorbed += available;
             return true;
@@ -1158,10 +1203,11 @@ public class explosionstep {
             return false;
         }
 
-        if (wall) {
-            absorbed += spent;
-            destroyed.add(pos);
-        }
+        recordMaterialInteraction(
+                pos,
+                spent,
+                wall || liquidDestroyed
+        );
 
         // Распространение энергии.
         for (int i = 0; i < DIRECTIONS; i++) {
@@ -1234,7 +1280,9 @@ public class explosionstep {
             // Сохранение части предыдущего направления.
             if (k > 0.0) {
 
-                double a = DIRECTION_MEMORY;
+                double a = liquid && !liquidDestroyed
+                        ? DIRECTION_MEMORY * LIQUID_DIRECTION_FACTOR
+                        : DIRECTION_MEMORY;
                 double bb = 1.0 - a;
 
                 double inv = 1.0 / Math.sqrt(
@@ -1812,5 +1860,17 @@ public class explosionstep {
         adaptiveHotZ = adaptiveHotSize = 0;
 
         return report;
+    }
+
+    private void recordMaterialInteraction(
+            long pos,
+            double spent,
+            boolean destroy
+    ) {
+        absorbed += spent;
+
+        if (destroy) {
+            destroyed.add(pos);
+        }
     }
 }
