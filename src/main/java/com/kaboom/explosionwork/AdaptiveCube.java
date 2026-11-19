@@ -3,6 +3,8 @@ package com.kaboom.explosionwork;
 import java.util.Arrays;
 import java.util.ArrayDeque;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import com.kaboom.server.EntitySnapshot;
+import java.util.List;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
@@ -22,6 +24,8 @@ public class AdaptiveCube {
     private static final double GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0));
     private static final double[][][] DIRECTIONS = createDirections();
     private static final GeometryTable[] GEOMETRY_TABLES = createGeometryTables();
+    private int[] damageBoxIndexes = new int[0];
+    private int[] damageBoxCounts = new int[0];
 
     // Не обращается к WorldServer: получает данные только через receive().
     private final int x, y, z, size;
@@ -680,12 +684,57 @@ public class AdaptiveCube {
         if (reusableBuckets.size() < MAX_REUSED_BUCKETS) reusableBuckets.addFirst(due);
     }
 
-    public void process(long tick, EnergyOutput output) {
+    public void process(
+            long tick,
+            EnergyOutput output,
+            List<EntitySnapshot.Hitbox> hitboxes,
+            explosionstep.DamageSink damageSink
+    ) {
         if (tick < 0 || output == null)
             throw new IllegalArgumentException("Invalid process args");
         if (previousTick != Long.MIN_VALUE && tick != previousTick + 1)
             throw new IllegalStateException("AdaptiveCube requires consecutive ticks");
         previousTick = tick;
+        int damageBoxCount = 0;
+
+        if (incomingCount > 0
+                && hitboxes != null
+                && damageSink != null) {
+
+            int count = hitboxes.size();
+
+            if (damageBoxIndexes.length < count) {
+                damageBoxIndexes = new int[count];
+                damageBoxCounts = new int[count];
+            }
+
+            for (int i = 0; i < count; i++) {
+                EntitySnapshot.Hitbox box = hitboxes.get(i);
+
+                int nx = overlapCells(
+                        box.minX, box.maxX, x, size
+                );
+
+                if (nx == 0) continue;
+
+                int ny = overlapCells(
+                        box.minY, box.maxY, y, size
+                );
+
+                if (ny == 0) continue;
+
+                int nz = overlapCells(
+                        box.minZ, box.maxZ, z, size
+                );
+
+                if (nz == 0) continue;
+
+                damageBoxIndexes[damageBoxCount] = i;
+                damageBoxCounts[damageBoxCount] = nx * ny * nz;
+
+                damageBoxCount++;
+            }
+        }
         for (int i = incomingCount - 1; i >= 0; i--) {
             int p = i * INPUT_STRIDE, off = inputOffset[i] & 65535;
             scratch.energy = inputData[p];
@@ -705,6 +754,32 @@ public class AdaptiveCube {
             preparedOutgoing = 0;
             double before = escapedEnergy;
             long start = System.nanoTime();
+            if (damageBoxCount > 0) {
+
+                double damage = scratch.energy
+                        * explosionstep.ENTITY_DAMAGE_SCALE
+                        / (size * size * size);
+
+                if (Double.isFinite(damage) && damage > 0.0) {
+
+                    for (int j = 0; j < damageBoxCount; j++) {
+
+                        EntitySnapshot.Hitbox box =
+                                hitboxes.get(damageBoxIndexes[j]);
+
+                        int intersections = damageBoxCounts[j];
+
+                        for (int k = 0; k < intersections; k++) {
+                            damageSink.hit(
+                                    box.entityId,
+                                    box.entityUuid,
+                                    box.partIndex,
+                                    damage
+                            );
+                        }
+                    }
+                }
+            }
             prepare(scratch);
             long nanos = System.nanoTime() - start;
             diagnostics.prepared++;
@@ -846,5 +921,24 @@ public class AdaptiveCube {
             receivedEnergy = generatedEnergy = 0.0;
             emittedEnergy = culledEnergy = escapedEnergy = 0.0;
         }
+    }
+
+    private static int overlapCells(
+            double min,
+            double max,
+            int cubeStart,
+            int cubeSize
+    ) {
+        int first = Math.max(
+                cubeStart,
+                (int) Math.floor(min)
+        );
+
+        int end = Math.min(
+                cubeStart + cubeSize,
+                (int) Math.ceil(max)
+        );
+
+        return Math.max(0, end - first);
     }
 }

@@ -1,6 +1,9 @@
 package com.kaboom.explosionwork;
 
 import static com.kaboom.ModLogger.LOGGER;
+
+import java.util.ArrayDeque;
+import java.util.UUID;
 import java.util.concurrent.locks.LockSupport;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -148,11 +151,12 @@ public class DimensionWorker {
                 start = System.nanoTime();
 
                 boolean waveWasActive =
-                        physics.hasPending() || pendingDestroyApply;
+                        physics.hasPending() || pendingDestroyApply || !pendingDamage.isEmpty();
 
 // Нельзя рассчитывать следующий шаг, пока
 // разрушения предыдущего не переданы серверу.
-                if (!pendingDestroyApply || applyPendingDestructions()) {
+                if (flushPendingDamage()
+                        && (!pendingDestroyApply || applyPendingDestructions()))  {
 
                     // Регистрируем новые источники энергии.
                     processPendingExplosions();
@@ -166,7 +170,7 @@ public class DimensionWorker {
                         long physicsStart = System.nanoTime();
 
                         boolean finished =
-                                physics.step(snapshotManager);
+                                physics.step(snapshotManager, damageSink);
 
                         int activeCells = physics.getCellsLastStep();
 
@@ -213,7 +217,7 @@ public class DimensionWorker {
                                 && !waveWasActive
                                 && !physics.hasPending()
                                 && !pendingDestroyApply;
-                if (idle != wasIdle) {
+                if (idle != wasIdle && pendingDamage.isEmpty()) {
                     LOGGER.debug("DimensionWorker state: dimension={}, state={}",
                             dimensionId, idle ? "idle" : "active");
                     wasIdle = idle;
@@ -490,6 +494,94 @@ public class DimensionWorker {
     }
     public SnapshotManager getSnapshotManager() {
         return snapshotManager;
+    }
+
+    private static final class PendingDamage {
+        final int entityId;
+        final UUID uuid;
+        final int partIndex;
+        final double damage;
+
+        PendingDamage(
+                int entityId,
+                UUID uuid,
+                int partIndex,
+                double damage
+        ) {
+            this.entityId = entityId;
+            this.uuid = uuid;
+            this.partIndex = partIndex;
+            this.damage = damage;
+        }
+    }
+
+    private final ArrayDeque<PendingDamage> pendingDamage =
+            new ArrayDeque<>();
+
+    private final explosionstep.DamageSink damageSink =
+            this::submitEntityDamage;
+
+    private void submitEntityDamage(
+            int entityId,
+            UUID uuid,
+            int partIndex,
+            double damage
+    ) {
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (pendingDamage.isEmpty()
+                && manager != null
+                && manager.submitDamage(
+                dimensionId,
+                entityId,
+                uuid,
+                partIndex,
+                damage
+        )) {
+            return;
+        }
+
+        pendingDamage.addLast(
+                new PendingDamage(
+                        entityId,
+                        uuid,
+                        partIndex,
+                        damage
+                )
+        );
+    }
+    private boolean flushPendingDamage() {
+
+        if (pendingDamage.isEmpty()) {
+            return true;
+        }
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (manager == null) {
+            return false;
+        }
+
+        while (!pendingDamage.isEmpty()) {
+
+            PendingDamage hit = pendingDamage.peekFirst();
+
+            if (!manager.submitDamage(
+                    dimensionId,
+                    hit.entityId,
+                    hit.uuid,
+                    hit.partIndex,
+                    hit.damage
+            )) {
+                return false;
+            }
+
+            pendingDamage.removeFirst();
+        }
+
+        return true;
     }
 
     //snapshotManager.processIncomingSnapshots(4);

@@ -20,7 +20,6 @@ import java.util.UUID;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.Collections;
 
 import static com.kaboom.ModLogger.LOGGER;
 

@@ -12,6 +12,9 @@ import java.util.ArrayDeque;
 import it.unimi.dsi.fastutil.ints.Int2IntMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import java.util.Iterator;
+import com.kaboom.server.EntitySnapshot;
+import java.util.List;
+import java.util.UUID;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -60,6 +63,21 @@ public class explosionstep {
 
     private final Long2ObjectOpenHashMap<AdaptiveCube> macroSixteen =
             new Long2ObjectOpenHashMap<>();
+
+    static final double ENTITY_DAMAGE_SCALE = 1;
+
+    @FunctionalInterface
+    public interface DamageSink {
+        void hit(int entityId, UUID uuid, int partIndex, double damage);
+    }
+
+    private DamageSink damageSink;
+    private EntitySnapshot.Frame entityFrame;
+
+    private long lastEntitySection = Long.MIN_VALUE;
+    private List<EntitySnapshot.Hitbox> lastSectionHitboxes;
+
+    private boolean handedToMacro;
 
     private long macroReceivedCells;
 
@@ -859,6 +877,7 @@ public class explosionstep {
             int c,
             SnapshotManager snapshots
     ) {
+        handedToMacro = false;
         double incident = b.energy[c];
 
         if (incident <= 0.0) {
@@ -916,6 +935,7 @@ public class explosionstep {
                         b.momentZ[c],
                         arrival
                 );
+                handedToMacro = true;
 
                 macroReceivedCells++;
 
@@ -1311,13 +1331,22 @@ public class explosionstep {
         return true;
     }
 
-    public boolean step(SnapshotManager snapshots) {
+    public boolean step(
+            SnapshotManager snapshots,
+            DamageSink damageSink
+    ) {
 
         if (awaitingDestructionApply) {
             throw new IllegalStateException(
                     "Apply destroyed blocks before the next step"
             );
         }
+
+        this.damageSink = damageSink;
+        this.entityFrame = snapshots.getEntitySnapshot();
+
+        lastEntitySection = Long.MIN_VALUE;
+        lastSectionHitboxes = null;
 
         activateDistant();
 
@@ -1356,11 +1385,12 @@ public class explosionstep {
 
             if (!processCell(bucket, nextCell, snapshots)) {
 
-                // Отсутствует снимок: откладываем только
-                // эту клетку, продолжая остальные.
                 parkCell(bucket, nextCell);
-
                 deferredLastStep++;
+
+            } else if (!handedToMacro) {
+
+                damageCell(bucket, nextCell);
             }
 
             nextCell++;
@@ -1730,7 +1760,19 @@ public class explosionstep {
             // в обычную очередь физических волн.
             long startNs = System.nanoTime();
 
-            cube.process(currentTick, this::emitAt);
+            List<EntitySnapshot.Hitbox> hitboxes =
+                    hitboxesInSection(
+                            cube.getX(),
+                            cube.getY(),
+                            cube.getZ()
+                    );
+
+            cube.process(
+                    currentTick,
+                    this::emitAt,
+                    hitboxes,
+                    damageSink
+            );
 
             long durationNs = System.nanoTime() - startNs;
 
@@ -1873,6 +1915,67 @@ public class explosionstep {
 
         if (destroy) {
             destroyed.add(pos);
+        }
+    }
+
+    private List<EntitySnapshot.Hitbox> hitboxesInSection(
+            int x, int y, int z
+    ) {
+        if (entityFrame == null || entityFrame.sections.isEmpty()) {
+            return null;
+        }
+
+        long key = pack(x >> 4, y >> 4, z >> 4);
+
+        if (key != lastEntitySection) {
+            lastEntitySection = key;
+            lastSectionHitboxes = entityFrame.sections.get(key);
+        }
+
+        return lastSectionHitboxes;
+    }
+
+    private void damageCell(WaveBucket bucket, int cell) {
+        if (damageSink == null) {
+            return;
+        }
+
+        double energy = bucket.energy[cell];
+
+        if (energy <= 0.0) {
+            return;
+        }
+
+        long pos = bucket.position[cell];
+
+        int x = unpackX(pos);
+        int y = unpackY(pos);
+        int z = unpackZ(pos);
+
+        List<EntitySnapshot.Hitbox> hitboxes =
+                hitboxesInSection(x, y, z);
+
+        if (hitboxes == null) {
+            return;
+        }
+
+        double damage = energy * ENTITY_DAMAGE_SCALE;
+
+        if (!Double.isFinite(damage) || damage <= 0.0) {
+            return;
+        }
+
+        for (int i = 0, count = hitboxes.size(); i < count; i++) {
+            EntitySnapshot.Hitbox box = hitboxes.get(i);
+
+            if (box.intersectsCell(x, y, z)) {
+                damageSink.hit(
+                        box.entityId,
+                        box.entityUuid,
+                        box.partIndex,
+                        damage
+                );
+            }
         }
     }
 }
