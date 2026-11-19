@@ -2,6 +2,7 @@ package com.kaboom.explosionwork;
 
 import java.util.Arrays;
 import java.util.ArrayDeque;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
@@ -20,12 +21,20 @@ public class AdaptiveCube {
     private static final double[] ATTENUATION_FACTORS = createAttenuationFactors();
     private static final double GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0));
     private static final double[][][] DIRECTIONS = createDirections();
+    private static final GeometryTable[] GEOMETRY_TABLES = createGeometryTables();
 
     // Не обращается к WorldServer: получает данные только через receive().
     private final int x, y, z, size;
     private final int count;
     private final double[][] dirs;
     private final double[] weights;
+    private final GeometryTable geometryTable;
+    // Local coordinates lose some fraction bits when translated near world borders.
+    // Preserve the original world-coordinate geometry there.
+    private final boolean useSharedGeometry;
+    // One (source,target) pair per face slot, translated to this cube's world coordinates.
+    private final long[] faceSources, faceTargets;
+    private final boolean[] faceEscaped;
     private final EnergyPacket scratch = new EnergyPacket();
 
     private static final int INPUT_STRIDE = 5;
@@ -44,6 +53,13 @@ public class AdaptiveCube {
     private int pendingExitObjects;
     private double preparedOutgoing;
     private final Diagnostics diagnostics = new Diagnostics();
+
+    // Временные корзины и моменты прибытия общие для всех выходов одного луча.
+    // Буферы переиспользуются; новых объектов на луч или выход не создаём.
+    private final long[] rayTicks = new long[3];
+    private final double[] rayArrivals = new double[3];
+    private final TickBucket[] rayBuckets = new TickBucket[3];
+    private boolean rayScheduleReady;
 
     private static final class TickBucket {
         // 0 — слот не занят; индекс записи хранится с прибавленной единицей.
@@ -111,6 +127,8 @@ public class AdaptiveCube {
         int exitCandidates;
         double energy, momentX, momentY, momentZ, time, timeVariance;
         double centerX, centerY, centerZ, varianceX, varianceY, varianceZ;
+        double earliestArrival;
+        int localOrigin;
     }
 
     public AdaptiveCube(int x, int y, int z, int size) {
@@ -130,6 +148,13 @@ public class AdaptiveCube {
         weights = new double[count];
 
         faceSlots = 6 * size * size;
+        geometryTable = GEOMETRY_TABLES[Integer.numberOfTrailingZeros(size) - 1];
+        useSharedGeometry = Math.abs((long) x) < (1L << 18)
+                && Math.abs((long) z) < (1L << 18);
+        faceSources = new long[faceSlots];
+        faceTargets = new long[faceSlots];
+        faceEscaped = new boolean[faceSlots];
+        prepareFacePairs();
     }
 
     public AdaptiveCube(oktoderevo.AirRegion region) {
@@ -160,6 +185,194 @@ public class AdaptiveCube {
         activePackets++;
         diagnostics.received++;
         diagnostics.receivedEnergy += e;
+    }
+
+    // Shared, immutable geometry rows. They are built only for entry cells that
+    // actually receive energy. No WorldServer or per-packet data is cached.
+    private static final class GeometryRow {
+        // Per direction: distance, spread for zero timeVariance, w00, w01, w10, w11.
+        final double[] values;
+        // Four face slots per direction, before thresholding and duplicate merging.
+        final short[] slots;
+
+        GeometryRow(int count) {
+            values = new double[6 * count];
+            slots = new short[4 * count];
+        }
+    }
+
+    private static final class GeometryTable {
+        final int size;
+        final double[][] directions;
+        final AtomicReferenceArray<GeometryRow> rows;
+
+        GeometryTable(int size, double[][] directions) {
+            this.size = size;
+            this.directions = directions;
+            rows = new AtomicReferenceArray<>(size * size * size);
+        }
+
+        GeometryRow get(int cell) {
+            GeometryRow row = rows.get(cell);
+            if (row != null) return row;
+            GeometryRow calculated = create(cell);
+            if (rows.compareAndSet(cell, null, calculated)) return calculated;
+            return rows.get(cell);
+        }
+
+        private GeometryRow create(int cell) {
+            GeometryRow row = new GeometryRow(directions.length);
+            double ox = (cell % size) + .5;
+            double oy = ((cell / size) % size) + .5;
+            double oz = (cell / (size * size)) + .5;
+
+            for (int i = 0; i < directions.length; i++) {
+                double ux = directions[i][0], uy = directions[i][1], uz = directions[i][2];
+                double tx = ux > 1e-12 ? (size - ox) / ux
+                        : ux < -1e-12 ? -ox / ux : Double.POSITIVE_INFINITY;
+                double ty = uy > 1e-12 ? (size - oy) / uy
+                        : uy < -1e-12 ? -oy / uy : Double.POSITIVE_INFINITY;
+                double tz = uz > 1e-12 ? (size - oz) / uz
+                        : uz < -1e-12 ? -oz / uz : Double.POSITIVE_INFINITY;
+                int face = tx <= ty && tx <= tz ? 0 : ty <= tz ? 1 : 2;
+                double distance = Math.min(tx, Math.min(ty, tz));
+                int data = 6 * i;
+                if (!Double.isFinite(distance) || distance <= 0.0) continue;
+
+                row.values[data] = distance;
+                row.values[data + 1] = Math.sqrt(2.0 * Math.max(0.0, .06 * distance));
+                double hx = ox + ux * distance;
+                double hy = oy + uy * distance;
+                double hz = oz + uz * distance;
+                double fa = (face == 0 ? hy : hx) - .5;
+                double fb = (face == 2 ? hy : hz) - .5;
+                int a0 = (int) Math.floor(fa), b0 = (int) Math.floor(fb);
+                double aw = fa - a0, bw = fb - b0;
+                row.values[data + 2] = (1.0 - aw) * (1.0 - bw);
+                row.values[data + 3] = (1.0 - aw) * bw;
+                row.values[data + 4] = aw * (1.0 - bw);
+                row.values[data + 5] = aw * bw;
+
+                int aFirst = clampCell(a0, 0, size - 1);
+                int aSecond = clampCell(a0 + 1, 0, size - 1);
+                int bFirst = clampCell(b0, 0, size - 1);
+                int bSecond = clampCell(b0 + 1, 0, size - 1);
+                double component = face == 0 ? ux : face == 1 ? uy : uz;
+                int base = (face * 2 + (component > 0.0 ? 1 : 0)) * size * size;
+                int slot = 4 * i;
+                row.slots[slot] = (short) (base + aFirst * size + bFirst);
+                row.slots[slot + 1] = (short) (base + aFirst * size + bSecond);
+                row.slots[slot + 2] = (short) (base + aSecond * size + bFirst);
+                row.slots[slot + 3] = (short) (base + aSecond * size + bSecond);
+            }
+            return row;
+        }
+    }
+
+    private static GeometryTable[] createGeometryTables() {
+        GeometryTable[] tables = new GeometryTable[4];
+        for (int level = 0; level < tables.length; level++)
+            tables[level] = new GeometryTable(2 << level, DIRECTIONS[level]);
+        return tables;
+    }
+
+    private void prepareFacePairs() {
+        int area = size * size;
+        for (int slot = 0; slot < faceSlots; slot++) {
+            int faceGroup = slot / area;
+            int face = faceGroup / 2;
+            int step = (faceGroup & 1) == 1 ? 1 : -1;
+            int a = (slot % area) / size;
+            int b = slot % size;
+
+            int sx = face == 0 ? (step > 0 ? x + size - 1 : x) : x + a;
+            int sy = face == 1 ? (step > 0 ? y + size - 1 : y)
+                    : face == 0 ? y + a : y + b;
+            int sz = face == 2 ? (step > 0 ? z + size - 1 : z) : z + b;
+            int tx = sx + (face == 0 ? step : 0);
+            int ty = sy + (face == 1 ? step : 0);
+            int tz = sz + (face == 2 ? step : 0);
+            boolean escaped = ty < 0 || ty >= 256 || tx < -30000000 || tx > 30000000
+                    || tz < -30000000 || tz > 30000000;
+            faceEscaped[slot] = escaped;
+            if (!escaped) {
+                faceSources[slot] = pack(sx, sy, sz);
+                faceTargets[slot] = pack(tx, ty, tz);
+            }
+        }
+    }
+
+    // No divisions, floor/clamp, ray-face intersections or coordinate packing
+    // in this hot path: only energy-dependent work remains.
+    private void appendCachedOrigin(EnergyPacket packet, double totalWeight) {
+        GeometryRow geometry = geometryTable.get(packet.localOrigin);
+        diagnostics.origins++;
+        diagnostics.directions += count;
+        for (int i = 0; i < count; i++) {
+            double energy = packet.energy * weights[i] / totalWeight;
+            if (energy < MIN_ACTIVE_ENERGY) continue;
+            int data = 6 * i;
+            double distance = geometry.values[data];
+            if (distance <= 0.0) continue;
+            diagnostics.attenuationCalls++;
+            energy *= sectorTransmittance(packet.energy, distance);
+            if (energy < MIN_ACTIVE_ENERGY) continue;
+            appendCachedFaceExits(packet, geometry, i, energy);
+        }
+    }
+
+    private void appendCachedFaceExits(EnergyPacket packet, GeometryRow geometry,
+                                       int direction, double energy) {
+        int data = 6 * direction;
+        int base = 4 * direction;
+        double e00 = energy * geometry.values[data + 2];
+        double e01 = energy * geometry.values[data + 3];
+        double e10 = energy * geometry.values[data + 4];
+        double e11 = energy * geometry.values[data + 5];
+        if (e00 < MIN_ACTIVE_ENERGY) e00 = 0.0;
+        if (e01 < MIN_ACTIVE_ENERGY) e01 = 0.0;
+        if (e10 < MIN_ACTIVE_ENERGY) e10 = 0.0;
+        if (e11 < MIN_ACTIVE_ENERGY) e11 = 0.0;
+
+        short[] slots = geometry.slots;
+        if (slots[base] == slots[base + 2]) {
+            if (e00 > 0 && e10 > 0) diagnostics.faceDuplicatesMerged++;
+            if (e01 > 0 && e11 > 0) diagnostics.faceDuplicatesMerged++;
+            e00 += e10;
+            e01 += e11;
+            e10 = e11 = 0.0;
+        }
+        if (slots[base] == slots[base + 1]) {
+            if (e00 > 0 && e01 > 0) diagnostics.faceDuplicatesMerged++;
+            if (e10 > 0 && e11 > 0) diagnostics.faceDuplicatesMerged++;
+            e00 += e01;
+            e10 += e11;
+            e01 = e11 = 0.0;
+        }
+
+        // Каждый луч имеет только одну тройку временных частей.
+        // Расчёт и поиск TickBucket откладываем до первого неэкранированного выхода.
+        rayScheduleReady = false;
+        double distance = geometry.values[data];
+        double arrival = packet.time + .5 + 1.35 * distance;
+        double spread = packet.timeVariance == 0.0 ? geometry.values[data + 1]
+                : Math.sqrt(2.0 * Math.max(0.0, packet.timeVariance + .06 * distance));
+        if (e00 != 0.0) appendCachedExit(packet, slots[base] & 65535, e00, direction, arrival, spread);
+        if (e01 != 0.0) appendCachedExit(packet, slots[base + 1] & 65535, e01, direction, arrival, spread);
+        if (e10 != 0.0) appendCachedExit(packet, slots[base + 2] & 65535, e10, direction, arrival, spread);
+        if (e11 != 0.0) appendCachedExit(packet, slots[base + 3] & 65535, e11, direction, arrival, spread);
+    }
+
+    private void appendCachedExit(EnergyPacket packet, int slot, double energy,
+                                  int direction, double arrival, double spread) {
+        if (faceEscaped[slot]) {
+            escapedEnergy += energy;
+            diagnostics.escapedParts++;
+            diagnostics.escapedEnergy += energy;
+        } else {
+            addExit(packet, faceSources[slot], faceTargets[slot],
+                    energy, direction, slot, arrival, spread);
+        }
     }
 
     private static long pack(int x, int y, int z) {
@@ -212,36 +425,48 @@ public class AdaptiveCube {
         return value;
     }
 
-    // Каждую из трёх временных частей сразу складываем в (тик, пара блоков).
-    // Только накопленная группа хранится в очереди — исходные exit-объекты не нужны.
+    // Один раз на луч. Вызывается лениво: полностью отсечённый луч или выход
+    // за границы мира не создаёт пустых корзин и не продлевает жизнь пакета.
+    private void prepareRaySchedule(EnergyPacket packet, double arrival, double spread) {
+        double earliest = packet.earliestArrival;
+        for (int part = 0; part < 3; part++) {
+            // Сохраняем исходный порядок операций, включая округление double.
+            double partArrival = Math.max(earliest, arrival + (part - 1) * spread);
+            long tick = (long) Math.floor(partArrival);
+            if (tick < previousTick) tick = previousTick;
+            if (tick > packet.lastTick) packet.lastTick = tick;
+            rayTicks[part] = tick;
+            rayArrivals[part] = Math.max(partArrival, (double) tick);
+            rayBuckets[part] = part > 0 && tick == rayTicks[part - 1]
+                    ? rayBuckets[part - 1] : bucket(tick);
+        }
+        rayScheduleReady = true;
+    }
+
+    // Каждую временную часть сразу складываем в (тик, пара блоков), сохраняя
+    // прежний порядок накопления: выход -> временные части 0, 1, 2.
     private void addExit(EnergyPacket packet, long source, long target,
                          double energy, int direction, int slot, double arrival, double spread) {
         packet.exitCandidates++;
         preparedOutgoing += energy;
         diagnostics.rawExits++;
-        double earliest = Math.floor(packet.time) + 1.0;
+        if (!rayScheduleReady) prepareRaySchedule(packet, arrival, spread);
+
         double[] dir = dirs[direction];
         for (int part = 0; part < 3; part++) {
-            double partArrival = Math.max(earliest, arrival + (part - 1) * spread);
-            long tick = (long) Math.floor(partArrival);
-            if (tick < previousTick) tick = previousTick;
-            if (tick > packet.lastTick) packet.lastTick = tick;
-
             double partEnergy = energy * (part == 1 ? .5 : .25);
-            TickBucket atTick = bucket(tick);
+            TickBucket atTick = rayBuckets[part];
             if (partEnergy >= MIN_ACTIVE_ENERGY) {
-                double effectiveArrival = Math.max(partArrival, (double) tick);
                 if (atTick.add(slot, source, target, partEnergy,
                         partEnergy * dir[0], partEnergy * dir[1],
-                        partEnergy * dir[2], effectiveArrival)) {
+                        partEnergy * dir[2], rayArrivals[part])) {
                     pendingExitObjects++;
                     diagnostics.exitsCreated++;
                 } else {
                     diagnostics.sameTickMerges++;
                 }
             } else {
-                // Не суммируем слабые части до проверки порога — иначе возникнет
-                // энергия, которая в исходной модели должна была отсечься.
+                // Как и раньше, отсечение до объединения энергий.
                 atTick.culledParts++;
                 atTick.culledEnergy += partEnergy;
             }
@@ -279,6 +504,7 @@ public class AdaptiveCube {
         int no = positive ? normalMin + size : normalMin - 1;
         double arrival = packet.time + .5 + 1.35 * distance;
         double spread = Math.sqrt(2.0 * Math.max(0, packet.timeVariance + .06 * distance));
+        rayScheduleReady = false;
 
         // Сохраняем прежний порог: сначала отсекаем слабые части,
         // затем объединяем те, что после clampCell ведут в одну клетку.
@@ -397,11 +623,22 @@ public class AdaptiveCube {
             diagnostics.weakPacketsSkipped++;
             return;
         }
+        // Раньше Math.floor(packet.time) выполнялся для каждого выхода.
+        packet.earliestArrival = Math.floor(packet.time) + 1.0;
         double sx = Math.sqrt(Math.max(0, packet.varianceX));
         double sy = Math.sqrt(Math.max(0, packet.varianceY));
         double sz = Math.sqrt(Math.max(0, packet.varianceZ));
         if (sx + sy + sz < 1e-6) {
-            appendOrigin(packet, packet.centerX, packet.centerY, packet.centerZ, 1, total);
+            // process() always provides a block-center origin. Keep the
+            // original geometry path for any future non-centred input.
+            int local = packet.localOrigin;
+            int lx = local % size, ly = (local / size) % size, lz = local / (size * size);
+            if (useSharedGeometry && packet.centerX == x + lx + .5
+                    && packet.centerY == y + ly + .5 && packet.centerZ == z + lz + .5) {
+                appendCachedOrigin(packet, total);
+            } else {
+                appendOrigin(packet, packet.centerX, packet.centerY, packet.centerZ, 1, total);
+            }
             return;
         }
         appendOrigin(packet, packet.centerX + sx, packet.centerY + sy, packet.centerZ + sz, .25, total);
@@ -461,6 +698,8 @@ public class AdaptiveCube {
             scratch.centerY = y + ((off >> 4) & 15) + .5;
             scratch.centerZ = z + ((off >> 8) & 15) + .5;
             scratch.varianceX = scratch.varianceY = scratch.varianceZ = 0;
+            scratch.localOrigin = (off & 15) + size * (((off >> 4) & 15)
+                    + size * ((off >> 8) & 15));
             scratch.lastTick = Long.MIN_VALUE;
             scratch.exitCandidates = 0;
             preparedOutgoing = 0;
@@ -501,6 +740,8 @@ public class AdaptiveCube {
         activePackets = 0;
         pendingExitObjects = 0;
         preparedOutgoing = 0.0;
+        rayScheduleReady = false;
+        Arrays.fill(rayBuckets, null);
         scheduled.clear();
         reusableBuckets.clear();
         previousTick = Long.MIN_VALUE;
