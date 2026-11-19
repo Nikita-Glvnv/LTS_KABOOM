@@ -65,6 +65,13 @@ public class ExplosionHandler {
         if (worker != null) {
             worker.stop();
         }
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (manager != null) {
+            manager.resetDimension(dimensionId);
+        }
     }
 
     @SubscribeEvent

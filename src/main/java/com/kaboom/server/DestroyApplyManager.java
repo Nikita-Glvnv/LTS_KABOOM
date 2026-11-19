@@ -11,6 +11,16 @@ import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraft.init.Blocks;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.boss.EntityDragon;
+import net.minecraft.util.DamageSource;
+
+import java.util.UUID;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Collections;
 
 import static com.kaboom.ModLogger.LOGGER;
 
@@ -18,6 +28,10 @@ public class DestroyApplyManager {
     private static final int MAX_DESTROY_REQUESTS = 16384;
     private static final int MAX_DESTROYS_PER_TICK = 256;
     private static final long MAX_APPLY_NANOS = 2_000_000L;
+    private static final int MAX_DAMAGE_REQUESTS = 16384;
+
+    private final BlockingQueue<DamageRequest> damageQueue =
+            new ArrayBlockingQueue<>(MAX_DAMAGE_REQUESTS);
 
     private final BlockingQueue<DestroyRequest> destroyQueue =
             new ArrayBlockingQueue<>(MAX_DESTROY_REQUESTS);
@@ -52,6 +66,7 @@ public class DestroyApplyManager {
 
         try {
             processDestroyQueue(start);
+            processDamageQueue();
 
             // Здесь позже появятся другие очереди.
         } finally {
@@ -62,6 +77,9 @@ public class DestroyApplyManager {
     public void resetDimension(int dimensionId) {
 
         destroyQueue.removeIf(
+                request -> request.dimensionId == dimensionId
+        );
+        damageQueue.removeIf(
                 request -> request.dimensionId == dimensionId
         );
     }
@@ -137,6 +155,211 @@ public class DestroyApplyManager {
         }
 
         applyPendingChanges();
+    }
+
+    private static final class DamageRequest {
+        final int dimensionId;
+        final int entityId;
+        final UUID entityUuid;
+        final int partIndex;
+        final double damage;
+
+        DamageRequest(
+                int dimensionId,
+                int entityId,
+                UUID entityUuid,
+                int partIndex,
+                double damage
+        ) {
+            this.dimensionId = dimensionId;
+            this.entityId = entityId;
+            this.entityUuid = entityUuid;
+            this.partIndex = partIndex;
+            this.damage = damage;
+        }
+    }
+
+    public boolean submitDamage(
+            int dimensionId,
+            int entityId,
+            UUID entityUuid,
+            int partIndex,
+            double damage
+    ) {
+        Objects.requireNonNull(entityUuid, "entityUuid");
+
+        if (partIndex < -1
+                || !Double.isFinite(damage)
+                || damage < 0.0) {
+            throw new IllegalArgumentException(
+                    "Invalid damage request"
+            );
+        }
+
+        if (damage == 0.0) {
+            return true;
+        }
+
+        return damageQueue.offer(
+                new DamageRequest(
+                        dimensionId,
+                        entityId,
+                        entityUuid,
+                        partIndex,
+                        damage
+                )
+        );
+    }
+
+    private static final class DamageKey {
+        final int dimensionId;
+        final int entityId;
+        final UUID entityUuid;
+
+        DamageKey(DamageRequest request) {
+            dimensionId = request.dimensionId;
+            entityId = request.entityId;
+            entityUuid = request.entityUuid;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) return true;
+            if (!(obj instanceof DamageKey)) return false;
+
+            DamageKey other = (DamageKey) obj;
+
+            return dimensionId == other.dimensionId
+                    && entityId == other.entityId
+                    && entityUuid.equals(other.entityUuid);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = 31 * dimensionId + entityId;
+            return 31 * result + entityUuid.hashCode();
+        }
+    }
+
+    private void processDamageQueue() {
+
+        Map<DamageKey, Map<Integer, Double>> aggregated =
+                new LinkedHashMap<>();
+
+        int count = damageQueue.size();
+
+        for (int i = 0; i < count; i++) {
+
+            DamageRequest request = damageQueue.poll();
+
+            if (request == null) {
+                break;
+            }
+
+            DamageKey key = new DamageKey(request);
+
+            Map<Integer, Double> parts =
+                    aggregated.computeIfAbsent(
+                            key, k -> new HashMap<>()
+                    );
+
+            parts.merge(
+                    request.partIndex,
+                    request.damage,
+                    (a, b) -> Math.min(
+                            (double) Float.MAX_VALUE,
+                            a + b
+                    )
+            );
+        }
+
+        for (Map.Entry<DamageKey, Map<Integer, Double>> entry
+                : aggregated.entrySet()) {
+
+            try {
+                applyDamage(entry.getKey(), entry.getValue());
+            } catch (RuntimeException e) {
+                LOGGER.error(
+                        "Failed to apply entity damage: dimension={}, entityId={}",
+                        entry.getKey().dimensionId,
+                        entry.getKey().entityId,
+                        e
+                );
+            }
+        }
+    }
+
+    private void applyDamage(
+            DamageKey key,
+            Map<Integer, Double> damageByPart
+    ) {
+        WorldServer world = DimensionManager.getWorld(
+                key.dimensionId, false
+        );
+
+        if (world == null) {
+            return;
+        }
+
+        Entity parent = world.getEntityByID(key.entityId);
+
+        if (parent == null
+                || parent.isDead
+                || !key.entityUuid.equals(parent.getUniqueID())) {
+            return;
+        }
+
+        Entity[] parts = parent.getParts();
+
+        DamageSource source = DamageSource.causeExplosionDamage(
+                (EntityLivingBase) null
+        );
+
+        for (Map.Entry<Integer, Double> entry
+                : damageByPart.entrySet()) {
+
+            int partIndex = entry.getKey();
+
+            Entity target;
+
+            if (partIndex == -1) {
+
+                // У дракона прямой урон родителю обычно
+                // не проходит, поэтому используем тело.
+                target = parent instanceof EntityDragon
+                        ? ((EntityDragon) parent).dragonPartBody
+                        : parent;
+
+            } else if (parts != null
+                    && partIndex < parts.length) {
+
+                target = parts[partIndex];
+
+            } else {
+                continue;
+            }
+
+            if (target == null || target.isDead) {
+                continue;
+            }
+
+            // Обход стандартного периода неуязвимости.
+            if (parent instanceof EntityLivingBase) {
+                ((EntityLivingBase) parent).hurtResistantTime = 0;
+            }
+
+            if (target != parent
+                    && target instanceof EntityLivingBase) {
+                ((EntityLivingBase) target).hurtResistantTime = 0;
+            }
+
+            float amount = (float) Math.min(
+                    (double) Float.MAX_VALUE,
+                    entry.getValue()
+            );
+
+            target.attackEntityFrom(source, amount);
+        }
     }
 
 }
