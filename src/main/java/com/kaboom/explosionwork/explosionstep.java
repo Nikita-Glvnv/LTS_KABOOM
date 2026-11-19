@@ -743,7 +743,8 @@ public class explosionstep {
     void finishTick() {
 
         currentBucket().clear();
-        solidCache.clear();
+        cellTypeCache.clear();
+        cellTypeCache.defaultReturnValue((byte) -1);
         cachedAirRegion.size = 0;
         materialResistanceCache.clear();
         nextCell = 0;
@@ -776,7 +777,7 @@ public class explosionstep {
     private final double[] weights = new double[DIRECTIONS];
     private final double[] dots = new double[DIRECTIONS];
 
-    private final Long2ByteOpenHashMap solidCache =
+    private final Long2ByteOpenHashMap cellTypeCache =
             new Long2ByteOpenHashMap();
 
     private final Long2FloatOpenHashMap materialResistanceCache =
@@ -797,8 +798,8 @@ public class explosionstep {
     private double culled;
 
     public explosionstep() {
-        solidCache.defaultReturnValue((byte) -1);
-        materialResistanceCache.defaultReturnValue(Float.NaN);
+        cellTypeCache.clear();
+        cellTypeCache.defaultReturnValue((byte) -1);
     }
 
     public int destroyedCount() {
@@ -965,6 +966,7 @@ public class explosionstep {
                 resistance = block.resistance;
             }
         }
+        double reflect = 0.0;
         double spent = 0.0;
 
         // Взаимодействие с твёрдым блоком.
