@@ -1,7 +1,6 @@
 package com.kaboom.explosionwork;
 
 import java.util.Arrays;
-import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -12,6 +11,7 @@ import java.util.ArrayDeque;
 
 import it.unimi.dsi.fastutil.ints.Int2IntMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
+import java.util.Iterator;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -48,6 +48,24 @@ public class explosionstep {
 
     private final oktoderevo.AirRegion cachedAirRegion =
             new oktoderevo.AirRegion();
+
+    private static final boolean ENABLE_ADAPTIVE_CUBES = true;
+
+    private final Long2ObjectOpenHashMap<AdaptiveCube> macroEight =
+            new Long2ObjectOpenHashMap<>();
+
+    private final Long2ObjectOpenHashMap<AdaptiveCube> macroSixteen =
+            new Long2ObjectOpenHashMap<>();
+
+    private long macroReceivedCells;
+
+    public long getMacroReceivedCells() {
+        return macroReceivedCells;
+    }
+
+    public int getActiveMacroCubeCount() {
+        return macroEight.size() + macroSixteen.size();
+    }
 
     private static final double[] ANGULAR_WEIGHT = {
             0.0,
@@ -705,6 +723,10 @@ public class explosionstep {
     }
 
     public boolean hasPending() {
+        if (!macroEight.isEmpty() || !macroSixteen.isEmpty()) {
+            return true;
+        }
+
         if (!waitingBySection.isEmpty()) {
             return true;
         }
@@ -819,6 +841,61 @@ public class explosionstep {
         int x = unpackX(pos);
         int y = unpackY(pos);
         int z = unpackZ(pos);
+
+        if (ENABLE_ADAPTIVE_CUBES) {
+
+            // Находим самую большую полностью
+            // воздушную область, содержащую ячейку.
+            if (!isCachedAir(x, y, z)) {
+                if (!snapshots.getAirRegionIfReady(
+                        x, y, z, cachedAirRegion
+                )) {
+                    cachedAirRegion.size = 0;
+                }
+            }
+
+            int cubeSize = cachedAirRegion.size;
+
+            // Малые области обрабатываются обычной физикой.
+            if (cubeSize == 8 || cubeSize == 16) {
+
+                Long2ObjectOpenHashMap<AdaptiveCube> cubes =
+                        cubeSize == 16
+                                ? macroSixteen
+                                : macroEight;
+
+                long key = pack(
+                        cachedAirRegion.x,
+                        cachedAirRegion.y,
+                        cachedAirRegion.z
+                );
+
+                AdaptiveCube cube = cubes.get(key);
+
+                if (cube == null) {
+                    cube = new AdaptiveCube(cachedAirRegion);
+                    cubes.put(key, cube);
+                }
+
+                double arrival = b.arrivalSum[c] / incident;
+
+                cube.receive(
+                        x, y, z,
+                        incident,
+                        b.momentX[c],
+                        b.momentY[c],
+                        b.momentZ[c],
+                        arrival
+                );
+
+                macroReceivedCells++;
+
+                // Энергия передана макрокубу.
+                // Обычная физика эту ячейку
+                // повторно не обрабатывает.
+                return true;
+            }
+        }
 
         boolean wall;
         double h = 0.0;
@@ -1169,6 +1246,13 @@ public class explosionstep {
         }
 
         activateDistant();
+
+        // Сначала выпускаем готовые передачи
+// из макрокубов в текущий WaveBucket.
+        if (ENABLE_ADAPTIVE_CUBES) {
+            processMacroCubes(macroEight);
+            processMacroCubes(macroSixteen);
+        }
 
         deferredLastStep = 0;
         cellsLastStep = 0;
@@ -1543,5 +1627,29 @@ public class explosionstep {
                 / ((energy + WEAK_WAVE_ENERGY_SCALE)
                 * (e2 + WEAK_WAVE_FADE_SCALE
                 * WEAK_WAVE_FADE_SCALE));
+    }
+
+    private void processMacroCubes(
+            Long2ObjectOpenHashMap<AdaptiveCube> cubes
+    ) {
+        Iterator<Long2ObjectMap.Entry<AdaptiveCube>> iterator =
+                cubes.long2ObjectEntrySet().iterator();
+
+        while (iterator.hasNext()) {
+
+            AdaptiveCube cube = iterator.next().getValue();
+
+            // Передаём готовую энергию обратно
+            // в обычную очередь физических волн.
+            cube.process(currentTick, this::emitAt);
+            airAbsorbed += cube.takeAirLoss();
+            escaped += cube.takeEscapedEnergy();
+            culled += cube.takeCulledEnergy();
+
+            // Удаляем куб после выхода всех пакетов.
+            if (!cube.hasPending()) {
+                iterator.remove();
+            }
+        }
     }
 }

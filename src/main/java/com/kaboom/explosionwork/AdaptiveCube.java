@@ -3,8 +3,27 @@ package com.kaboom.explosionwork;
 import java.util.ArrayList;
 
 public class AdaptiveCube {
-    private static final double[][][] DIRECTIONS =
-            createDirections();
+    private double airLoss;
+    private double escapedEnergy;
+    private double culledEnergy;
+
+    public double takeAirLoss() {
+        double value = airLoss;
+        airLoss = 0.0;
+        return value;
+    }
+
+    public double takeEscapedEnergy() {
+        double value = escapedEnergy;
+        escapedEnergy = 0.0;
+        return value;
+    }
+
+    public double takeCulledEnergy() {
+        double value = culledEnergy;
+        culledEnergy = 0.0;
+        return value;
+    }
 
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
 
@@ -20,6 +39,9 @@ public class AdaptiveCube {
     // Угол для равномерного распределения направлений по сфере.
     private static final double GOLDEN_ANGLE =
             Math.PI * (3.0 - Math.sqrt(5.0));
+
+    private static final double[][][] DIRECTIONS =
+            createDirections();
 
     // Координаты минимального угла куба в мире.
     private int x;
@@ -383,7 +405,24 @@ public class AdaptiveCube {
 
             // Рассчитываем секторные выходы один раз.
             if (!packet.prepared) {
+                double escapedBefore = escapedEnergy;
+
                 prepare(packet);
+
+                double outgoing = 0.0;
+
+                for (SectorExit exit : packet.exits) {
+                    outgoing += exit.energy;
+                }
+
+                double escapedDuringPrepare =
+                        escapedEnergy - escapedBefore;
+
+                airLoss += Math.max(
+                        0.0,
+                        packet.energy - outgoing - escapedDuringPrepare
+                );
+
                 packet.prepared = true;
             }
 
@@ -398,9 +437,11 @@ public class AdaptiveCube {
                     int part = exit.nextPart;
 
                     double arrival = Math.max(
-                            packet.time,
-                            exit.arrival
-                                    + (part - 1) * exit.spread
+                            Math.floor(packet.time) + 1.0,
+                            Math.max(
+                                    packet.time,
+                                    exit.arrival + (part - 1) * exit.spread
+                            )
                     );
 
                     // Передача ещё не должна выйти из куба.
@@ -429,6 +470,8 @@ public class AdaptiveCube {
                                 energy * exit.dz,
                                 time
                         );
+                    }else {
+                        culledEnergy += energy;
                     }
 
                     exit.nextPart++;
@@ -771,6 +814,7 @@ public class AdaptiveCube {
                 if (dy < 0 || dy >= 256
                         || dx < -30000000 || dx > 30000000
                         || dz < -30000000 || dz > 30000000) {
+                    escapedEnergy += partEnergy;
                     continue;
                 }
 
