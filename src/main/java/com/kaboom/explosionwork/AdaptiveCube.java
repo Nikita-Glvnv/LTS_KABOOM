@@ -3,6 +3,9 @@ package com.kaboom.explosionwork;
 import java.util.ArrayList;
 
 public class AdaptiveCube {
+    private static final double[][][] DIRECTIONS =
+            createDirections();
+
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
 
     private static final double AIR_ATTENUATION = 0.15;
@@ -245,9 +248,11 @@ public class AdaptiveCube {
     }
 
     private void prepare(EnergyPacket packet) {
-
         int count = sampleCount();
 
+        int level = Integer.numberOfTrailingZeros(count) - 5;
+
+        double[][] directions = DIRECTIONS[level];
         double[] weights = new double[count];
 
         double px = packet.momentX;
@@ -274,23 +279,23 @@ public class AdaptiveCube {
 
         double totalWeight = 0.0;
 
-        // Распределяем энергию по угловым направлениям.
         for (int i = 0; i < count; i++) {
+            double[] dir = directions[i];
 
-            double dx = directionX(i, count);
-            double dy = directionY(i, count);
-            double dz = directionZ(i, count);
+            double dot =
+                    dir[0] * vx +
+                            dir[1] * vy +
+                            dir[2] * vz;
 
-            double dot = dx * vx + dy * vy + dz * vz;
+            // Изотропная составляющая.
+            double diffuse = 1.0 - k;
 
-            double diffuse = (1.0 - k) / 26.0;
-
-            double directed = dot > 0.0
-                    ? k * Math.pow(dot, LOBE_POWER)
-                    : 0.0;
+            // Направленная составляющая.
+            double directed = 2.0 * (LOBE_POWER + 1.0)
+                    * k
+                    * Math.pow(Math.max(0.0, dot), LOBE_POWER);
 
             weights[i] = diffuse + directed;
-
             totalWeight += weights[i];
         }
 
@@ -298,116 +303,50 @@ public class AdaptiveCube {
             return;
         }
 
-        // Для каждого направления вычисляем выход из куба.
-        for (int i = 0; i < count; i++) {
+        // Пространственное рассеивание исходного пакета.
+        double sx = Math.sqrt(Math.max(0.0, packet.varianceX));
+        double sy = Math.sqrt(Math.max(0.0, packet.varianceY));
+        double sz = Math.sqrt(Math.max(0.0, packet.varianceZ));
 
-            double energy = packet.energy
-                    * weights[i] / totalWeight;
-
-            if (energy < MIN_ACTIVE_ENERGY) {
-                continue;
-            }
-
-            double dx = directionX(i, count);
-            double dy = directionY(i, count);
-            double dz = directionZ(i, count);
-
-            double distance = intersectionDistance(
-                    packet, dx, dy, dz
+        if (sx + sy + sz < 1e-6) {
+            appendOrigin(
+                    packet,
+                    packet.centerX,
+                    packet.centerY,
+                    packet.centerZ,
+                    1.0,
+                    directions,
+                    weights,
+                    totalWeight
             );
-
-            if (!Double.isFinite(distance) || distance < 0.0) {
-                continue;
-            }
-
-            // Затухание при движении до границы.
-            energy *= sectorTransmittance(
-                    packet.energy,
-                    distance
-            );
-
-            // Энергия далее делится между тремя
-            // временными составляющими.
-            if (energy * 0.25 < MIN_ACTIVE_ENERGY) {
-                continue;
-            }
-
-            // Точки непосредственно перед и после границы.
-            double before = distance - 1e-6;
-            double after = distance + 1e-6;
-
-            int sx = (int) Math.floor(
-                    packet.centerX + dx * before
-            );
-            int sy = (int) Math.floor(
-                    packet.centerY + dy * before
-            );
-            int sz = (int) Math.floor(
-                    packet.centerZ + dz * before
-            );
-
-            int tx = (int) Math.floor(
-                    packet.centerX + dx * after
-            );
-            int ty = (int) Math.floor(
-                    packet.centerY + dy * after
-            );
-            int tz = (int) Math.floor(
-                    packet.centerZ + dz * after
-            );
-
-            // Источник должен оставаться внутри куба.
-            sx = Math.max(x, Math.min(x + size - 1, sx));
-            sy = Math.max(y, Math.min(y + size - 1, sy));
-            sz = Math.max(z, Math.min(z + size - 1, sz));
-
-            // Не создаём передачу, если координата цели
-            // из-за численной погрешности осталась внутри.
-            if (tx >= x && tx < x + size
-                    && ty >= y && ty < y + size
-                    && tz >= z && tz < z + size) {
-                continue;
-            }
-
-            // Границы игрового мира.
-            if (ty < 0 || ty >= 256
-                    || tx < -30000000 || tx > 30000000
-                    || tz < -30000000 || tz > 30000000) {
-                continue;
-            }
-
-            // Выходная передача должна оставаться локальной
-            // относительно последней ячейки куба.
-            if (Math.abs(sx - tx) > 1
-                    || Math.abs(sy - ty) > 1
-                    || Math.abs(sz - tz) > 1) {
-                throw new IllegalStateException(
-                        "Non-local sector exit"
-                );
-            }
-
-            // Приближённое время прохождения.
-            double arrival = packet.time
-                    + 0.5
-                    + 1.35 * distance;
-
-            // Разброс времени накапливается при движении.
-            double spread = Math.sqrt(
-                    2.0 * Math.max(
-                            0.0,
-                            packet.timeVariance + 0.06 * distance
-                    )
-            );
-
-            packet.exits.add(new SectorExit(
-                    pack(sx, sy, sz),
-                    pack(tx, ty, tz),
-                    energy,
-                    dx, dy, dz,
-                    arrival,
-                    spread
-            ));
+            return;
         }
+
+        // Четыре пространственных отсчёта,
+        // сохраняющих среднее положение и дисперсии.
+        appendOrigin(packet,
+                packet.centerX + sx,
+                packet.centerY + sy,
+                packet.centerZ + sz,
+                0.25, directions, weights, totalWeight);
+
+        appendOrigin(packet,
+                packet.centerX + sx,
+                packet.centerY - sy,
+                packet.centerZ - sz,
+                0.25, directions, weights, totalWeight);
+
+        appendOrigin(packet,
+                packet.centerX - sx,
+                packet.centerY + sy,
+                packet.centerZ - sz,
+                0.25, directions, weights, totalWeight);
+
+        appendOrigin(packet,
+                packet.centerX - sx,
+                packet.centerY - sy,
+                packet.centerZ + sz,
+                0.25, directions, weights, totalWeight);
     }
 
     public boolean hasPending() {
@@ -556,7 +495,39 @@ public class AdaptiveCube {
         }
     }
 
+    private static double[][][] createDirections() {
+        double[][][] tables = new double[4][][];
 
+        for (int level = 0; level < 4; level++) {
+            int count = 32 << level;
+            int half = count / 2;
+
+            double[][] directions = new double[count][3];
+
+            for (int i = 0; i < half; i++) {
+                double y = 1.0 - 2.0 * (i + 0.5) / half;
+                double r = Math.sqrt(Math.max(0.0, 1.0 - y * y));
+
+                double angle = i * GOLDEN_ANGLE;
+
+                double dx = r * Math.cos(angle);
+                double dz = r * Math.sin(angle);
+
+                directions[i][0] = dx;
+                directions[i][1] = y;
+                directions[i][2] = dz;
+
+                // Противоположное направление.
+                directions[i + half][0] = -dx;
+                directions[i + half][1] = -y;
+                directions[i + half][2] = -dz;
+            }
+
+            tables[level] = directions;
+        }
+
+        return tables;
+    }
 
 
     public void clear() {
@@ -580,6 +551,12 @@ public class AdaptiveCube {
     }
 
     private static void merge(EnergyPacket a, EnergyPacket b) {
+        if (a.prepared || b.prepared) {
+            throw new IllegalStateException(
+                    "Cannot merge packets after propagation preparation"
+            );
+        }
+
         double total = a.energy + b.energy;
 
         if (total <= 0.0) {
@@ -624,5 +601,188 @@ public class AdaptiveCube {
 
     private static double sq(double value) {
         return value * value;
+    }
+
+    private static int clampCell(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private double keepInside(double value, int min) {
+        return Math.max(
+                min + 1e-6,
+                Math.min(min + size - 1e-6, value)
+        );
+    }
+
+    private void appendOrigin(
+            EnergyPacket packet,
+            double ox, double oy, double oz,
+            double originWeight,
+            double[][] directions,
+            double[] weights,
+            double totalWeight
+    ) {
+        ox = keepInside(ox, x);
+        oy = keepInside(oy, y);
+        oz = keepInside(oz, z);
+
+        for (int i = 0; i < directions.length; i++) {
+            double energy = packet.energy
+                    * originWeight
+                    * weights[i] / totalWeight;
+
+            if (energy < MIN_ACTIVE_ENERGY) {
+                continue;
+            }
+
+            double ux = directions[i][0];
+            double uy = directions[i][1];
+            double uz = directions[i][2];
+
+            double tx = ux > 1e-12
+                    ? (x + size - ox) / ux
+                    : ux < -1e-12
+                    ? (x - ox) / ux
+                    : Double.POSITIVE_INFINITY;
+
+            double ty = uy > 1e-12
+                    ? (y + size - oy) / uy
+                    : uy < -1e-12
+                    ? (y - oy) / uy
+                    : Double.POSITIVE_INFINITY;
+
+            double tz = uz > 1e-12
+                    ? (z + size - oz) / uz
+                    : uz < -1e-12
+                    ? (z - oz) / uz
+                    : Double.POSITIVE_INFINITY;
+
+            int face = tx <= ty && tx <= tz
+                    ? 0 : ty <= tz ? 1 : 2;
+
+            double distance = Math.min(
+                    tx, Math.min(ty, tz)
+            );
+
+            if (!Double.isFinite(distance) || distance <= 0.0) {
+                continue;
+            }
+
+            // Затухание во время прохождения куба.
+            energy *= sectorTransmittance(
+                    packet.energy,
+                    distance
+            );
+
+            if (energy < MIN_ACTIVE_ENERGY) {
+                continue;
+            }
+
+            double hx = ox + ux * distance;
+            double hy = oy + uy * distance;
+            double hz = oz + uz * distance;
+
+            appendFaceExits(
+                    packet,
+                    face,
+                    hx, hy, hz,
+                    ux, uy, uz,
+                    distance,
+                    energy
+            );
+        }
+    }
+
+    private void appendFaceExits(
+            EnergyPacket packet,
+            int face,
+            double hx, double hy, double hz,
+            double ux, double uy, double uz,
+            double distance,
+            double energy
+    ) {
+        double ca = face == 0 ? hy : hx;
+        double cb = face == 2 ? hy : hz;
+
+        int minA = face == 0 ? y : x;
+        int minB = face == 2 ? y : z;
+
+        double fa = ca - 0.5;
+        double fb = cb - 0.5;
+
+        int a0 = (int) Math.floor(fa);
+        int b0 = (int) Math.floor(fb);
+
+        double aw = fa - a0;
+        double bw = fb - b0;
+
+        int normalMin = face == 0 ? x : face == 1 ? y : z;
+
+        double component = face == 0
+                ? ux : face == 1 ? uy : uz;
+
+        int normalInside = component > 0.0
+                ? normalMin + size - 1 : normalMin;
+
+        int normalOutside = component > 0.0
+                ? normalMin + size : normalMin - 1;
+
+        double arrival = packet.time + 0.5
+                + 1.35 * distance;
+
+        double spread = Math.sqrt(
+                2.0 * Math.max(
+                        0.0,
+                        packet.timeVariance + 0.06 * distance
+                )
+        );
+
+        for (int ai = 0; ai < 2; ai++) {
+            for (int bi = 0; bi < 2; bi++) {
+
+                double weight =
+                        (ai == 0 ? 1.0 - aw : aw)
+                                * (bi == 0 ? 1.0 - bw : bw);
+
+                double partEnergy = energy * weight;
+
+                if (partEnergy < MIN_ACTIVE_ENERGY) {
+                    continue;
+                }
+
+                int ia = clampCell(
+                        a0 + ai, minA, minA + size - 1
+                );
+
+                int ib = clampCell(
+                        b0 + bi, minB, minB + size - 1
+                );
+
+                int sx = face == 0 ? normalInside : ia;
+                int sy = face == 1
+                        ? normalInside : face == 0 ? ia : ib;
+                int sz = face == 2 ? normalInside : ib;
+
+                int dx = face == 0 ? normalOutside : ia;
+                int dy = face == 1
+                        ? normalOutside : face == 0 ? ia : ib;
+                int dz = face == 2 ? normalOutside : ib;
+
+                if (dy < 0 || dy >= 256
+                        || dx < -30000000 || dx > 30000000
+                        || dz < -30000000 || dz > 30000000) {
+                    continue;
+                }
+
+                packet.exits.add(new SectorExit(
+                        pack(sx, sy, sz),
+                        pack(dx, dy, dz),
+                        partEnergy,
+                        ux, uy, uz,
+                        arrival,
+                        spread
+                ));
+            }
+        }
     }
 }
