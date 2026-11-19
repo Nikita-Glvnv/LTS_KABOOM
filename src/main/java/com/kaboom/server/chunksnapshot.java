@@ -88,6 +88,9 @@ public class chunksnapshot {
         }
     }
 
+    private final EntitySnapshot entitySnapshot =
+            new EntitySnapshot(this);
+
     private static final class TrackedChunk {
         final int dimensionId;
         final int chunkX;
@@ -196,6 +199,24 @@ public class chunksnapshot {
         }
         LOGGER.info("Server snapshots initialized: worlds={}, requestsPerTick={}, initialSectionsPerTick={}",
                 DimensionManager.getWorlds().length, MAX_REQUESTS_PER_TICK, MAX_INITIAL_SECTIONS_PER_TICK);
+    }
+
+    boolean isTrackedSection(
+            int dimensionId,
+            int chunkX,
+            int chunkZ,
+            int sectionY
+    ) {
+        if (sectionY < 0 || sectionY >= 16) {
+            return false;
+        }
+
+        TrackedChunk tracked = getTrackedChunk(
+                dimensionId, chunkX, chunkZ
+        );
+
+        return tracked != null
+                && (tracked.requestedMask & (1 << sectionY)) != 0;
     }
 
     private TrackedChunk registerChunk(
@@ -667,6 +688,16 @@ public class chunksnapshot {
             stage = "scan";
             stageStart = System.nanoTime();
             updateController.scanSections();
+            stage = "entities";
+            for (WorldServer world : DimensionManager.getWorlds()) {
+
+                int dimensionId = world.provider.getDimension();
+
+                entitySnapshot.captureAndSend(
+                        world,
+                        trackedChunks.containsKey(dimensionId)
+                );
+            }
             metrics.scanNanos += System.nanoTime() - stageStart;
         } catch (RuntimeException | Error e) {
             LOGGER.error("Server snapshot tick failed: stage=" + stage

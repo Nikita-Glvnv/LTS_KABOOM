@@ -135,6 +135,7 @@ public class DimensionWorker {
                 stage = "snapshots";
                 long start = System.nanoTime();
                 int processed = snapshotManager.processIncomingSnapshots(MAX_SNAPSHOTS_PER_TICK);
+                snapshotManager.processIncomingEntitySnapshots();
                 snapshotTimeNs += System.nanoTime() - start;
                 snapshots += processed;
                 if (processed == MAX_SNAPSHOTS_PER_TICK) {

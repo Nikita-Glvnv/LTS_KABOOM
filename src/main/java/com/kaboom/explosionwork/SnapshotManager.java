@@ -3,15 +3,14 @@ package com.kaboom.explosionwork;
 import com.kaboom.server.chunksnapshot;
 import net.minecraft.util.math.ChunkPos;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import com.kaboom.Kaboom;
 import com.kaboom.server.ChunkLoadingManager;
 import java.util.concurrent.TimeUnit;
-import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicLong;
+import com.kaboom.server.EntitySnapshot;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static com.kaboom.ModLogger.LOGGER;
 
@@ -65,6 +64,11 @@ public class SnapshotManager {
     private Metrics metrics = new Metrics();
     private long metricsWindowStart = System.nanoTime();
 
+    private final Queue<EntitySnapshot.Frame> incomingEntities =
+            new ConcurrentLinkedQueue<>();
+
+    private volatile EntitySnapshot.Frame currentEntities;
+
     private final Map<Long, Long> lastTrackingRequests =
             new HashMap<>();
     private static final class SectionRequestState {
@@ -115,6 +119,11 @@ public class SnapshotManager {
             rejectedDimension.incrementAndGet();
             return false;
         }
+        if (update instanceof EntitySnapshot.Frame) {
+            incomingEntities.offer((EntitySnapshot.Frame) update);
+            return true;
+        }
+
         if (!incomingSections.offer(update)) {
             rejectedFullQueue.incrementAndGet();
             return false;
@@ -754,5 +763,21 @@ public class SnapshotManager {
         result.z += z & ~15;
 
         return true;
+    }
+    public int processIncomingEntitySnapshots() {
+
+        int processed = 0;
+        EntitySnapshot.Frame frame;
+
+        while ((frame = incomingEntities.poll()) != null) {
+            currentEntities = frame;
+            processed++;
+        }
+
+        return processed;
+    }
+
+    public EntitySnapshot.Frame getEntitySnapshot() {
+        return currentEntities;
     }
 }
