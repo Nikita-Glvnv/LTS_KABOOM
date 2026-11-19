@@ -117,6 +117,30 @@ public class explosionstep {
         }
     }
 
+    private final AdaptiveCube.Diagnostics adaptiveDiagnostics =
+            new AdaptiveCube.Diagnostics();
+
+    private long adaptiveCubeCalls;
+    private long adaptive8Calls;
+    private long adaptive16Calls;
+
+    private long adaptiveCubeTimeNs;
+    private long adaptive8TimeNs;
+    private long adaptive16TimeNs;
+
+    private long adaptiveMaxCubeNs;
+
+    private int adaptiveHotX;
+    private int adaptiveHotY;
+    private int adaptiveHotZ;
+    private int adaptiveHotSize;
+
+    private long adaptivePendingExitsThisStep;
+    private long adaptivePendingPacketsThisStep;
+
+    private long adaptiveMaxPendingExits;
+    private long adaptiveMaxPendingPackets;
+
     private static double materialLossFactor(double resistance) {
         double r = Math.max(0.0, resistance);
 
@@ -1250,8 +1274,21 @@ public class explosionstep {
         // Сначала выпускаем готовые передачи
 // из макрокубов в текущий WaveBucket.
         if (ENABLE_ADAPTIVE_CUBES) {
+            adaptivePendingExitsThisStep = 0;
+            adaptivePendingPacketsThisStep = 0;
             processMacroCubes(macroEight);
             processMacroCubes(macroSixteen);
+
+            adaptiveMaxPendingExits = Math.max(
+                    adaptiveMaxPendingExits,
+                    adaptivePendingExitsThisStep
+            );
+
+            adaptiveMaxPendingPackets = Math.max(
+                    adaptiveMaxPendingPackets,
+                    adaptivePendingPacketsThisStep
+            );
+
         }
 
         deferredLastStep = 0;
@@ -1641,15 +1678,139 @@ public class explosionstep {
 
             // Передаём готовую энергию обратно
             // в обычную очередь физических волн.
+            long startNs = System.nanoTime();
+
             cube.process(currentTick, this::emitAt);
+
+            long durationNs = System.nanoTime() - startNs;
+
+// Общее время обработки макрокубов.
+            adaptiveCubeCalls++;
+            adaptiveCubeTimeNs += durationNs;
+
+// Раздельная статистика по размерам.
+            if (cube.getSize() == 8) {
+                adaptive8Calls++;
+                adaptive8TimeNs += durationNs;
+            } else {
+                adaptive16Calls++;
+                adaptive16TimeNs += durationNs;
+            }
+
+// Поиск самого дорогого куба.
+            if (durationNs > adaptiveMaxCubeNs) {
+                adaptiveMaxCubeNs = durationNs;
+
+                adaptiveHotX = cube.getX();
+                adaptiveHotY = cube.getY();
+                adaptiveHotZ = cube.getZ();
+                adaptiveHotSize = cube.getSize();
+            }
+
+// Получаем статистику внутреннего расчёта.
+            cube.drainDiagnostics(adaptiveDiagnostics);
+
+// Существующий учёт энергетических потерь.
             airAbsorbed += cube.takeAirLoss();
             escaped += cube.takeEscapedEnergy();
             culled += cube.takeCulledEnergy();
 
-            // Удаляем куб после выхода всех пакетов.
+// Удаление завершённого куба.
             if (!cube.hasPending()) {
                 iterator.remove();
+            } else {
+                adaptivePendingPacketsThisStep += cube.getPacketCount();
+
+                adaptivePendingExitsThisStep +=
+                        cube.getPendingExitCount();
             }
         }
+    }
+
+    public String drainAdaptiveReport() {
+
+        if (adaptiveCubeCalls == 0
+                && adaptiveDiagnostics.received == 0
+                && getActiveMacroCubeCount() == 0) {
+            return null;
+        }
+
+        long otherNs = Math.max(
+                0L,
+                adaptiveCubeTimeNs - adaptiveDiagnostics.prepareNs
+        );
+
+        String report =
+                "calls=" + adaptiveCubeCalls
+                        + ", calls8=" + adaptive8Calls
+                        + ", calls16=" + adaptive16Calls
+
+                        + ", timeUs=" + adaptiveCubeTimeNs / 1000L
+                        + ", time8Us=" + adaptive8TimeNs / 1000L
+                        + ", time16Us=" + adaptive16TimeNs / 1000L
+
+                        + ", prepareUs=" + adaptiveDiagnostics.prepareNs / 1000L
+                        + ", otherProcessUs=" + otherNs / 1000L
+
+                        + ", maxPrepareUs=" + adaptiveDiagnostics.maxPrepareNs / 1000L
+                        + ", maxCubeUs=" + adaptiveMaxCubeNs / 1000L
+
+                        + ", hotCube=("
+                        + adaptiveHotX + ","
+                        + adaptiveHotY + ","
+                        + adaptiveHotZ
+                        + ";size=" + adaptiveHotSize + ")"
+
+                        + ", received=" + adaptiveDiagnostics.received
+                        + ", prepared=" + adaptiveDiagnostics.prepared
+                        + ", completed=" + adaptiveDiagnostics.completed
+
+                        + ", origins=" + adaptiveDiagnostics.origins
+                        + ", directions=" + adaptiveDiagnostics.directions
+                        + ", attenuations=" + adaptiveDiagnostics.attenuationCalls
+
+                        + ", exitsCreated=" + adaptiveDiagnostics.exitsCreated
+                        + ", exitsChecked=" + adaptiveDiagnostics.exitsChecked
+                        + ", exitsWaiting=" + adaptiveDiagnostics.exitsWaiting
+
+                        + ", emittedParts=" + adaptiveDiagnostics.emittedParts
+                        + ", culledParts=" + adaptiveDiagnostics.culledParts
+                        + ", escapedParts=" + adaptiveDiagnostics.escapedParts
+
+                        + ", maxExitsPerPacket="
+                        + adaptiveDiagnostics.maxExitsPerPacket
+
+                        + ", activeCubes=" + getActiveMacroCubeCount()
+
+                        + ", pendingPackets=" + adaptivePendingPacketsThisStep
+                        + ", pendingExits=" + adaptivePendingExitsThisStep
+
+                        + ", maxPendingPackets=" + adaptiveMaxPendingPackets
+                        + ", maxPendingExits=" + adaptiveMaxPendingExits
+
+                        + ", receivedEnergy=" + adaptiveDiagnostics.receivedEnergy
+                        + ", generatedEnergy=" + adaptiveDiagnostics.generatedEnergy
+                        + ", emittedEnergy=" + adaptiveDiagnostics.emittedEnergy
+                        + ", culledEnergy=" + adaptiveDiagnostics.culledEnergy
+                        + ", escapedEnergy=" + adaptiveDiagnostics.escapedEnergy;
+
+        // Сбрасываем интервальную статистику.
+        adaptiveDiagnostics.reset();
+
+        adaptiveCubeCalls = adaptive8Calls = adaptive16Calls = 0;
+
+        adaptiveCubeTimeNs = 0;
+        adaptive8TimeNs = 0;
+        adaptive16TimeNs = 0;
+
+        adaptiveMaxCubeNs = 0;
+
+        adaptiveMaxPendingExits = 0;
+        adaptiveMaxPendingPackets = 0;
+
+        adaptiveHotX = adaptiveHotY = 0;
+        adaptiveHotZ = adaptiveHotSize = 0;
+
+        return report;
     }
 }

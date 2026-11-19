@@ -43,6 +43,19 @@ public class AdaptiveCube {
     private static final double[][][] DIRECTIONS =
             createDirections();
 
+    private final Diagnostics diagnostics = new Diagnostics();
+
+    private int pendingExitObjects;
+
+    public int getPendingExitCount() {
+        return pendingExitObjects;
+    }
+
+    public void drainDiagnostics(Diagnostics target) {
+        target.add(diagnostics);
+        diagnostics.reset();
+    }
+
     // Координаты минимального угла куба в мире.
     private int x;
     private int y;
@@ -152,6 +165,8 @@ public class AdaptiveCube {
         packet.varianceZ = 0.0;
 
         packets.add(packet);
+        diagnostics.received++;
+        diagnostics.receivedEnergy += energy;
     }
 
     private static long pack(int x, int y, int z) {
@@ -407,7 +422,26 @@ public class AdaptiveCube {
             if (!packet.prepared) {
                 double escapedBefore = escapedEnergy;
 
+                long prepareStart = System.nanoTime();
+
                 prepare(packet);
+
+                long prepareDuration = System.nanoTime() - prepareStart;
+
+                diagnostics.prepared++;
+                diagnostics.prepareNs += prepareDuration;
+
+                diagnostics.maxPrepareNs = Math.max(
+                        diagnostics.maxPrepareNs,
+                        prepareDuration
+                );
+
+                diagnostics.maxExitsPerPacket = Math.max(
+                        diagnostics.maxExitsPerPacket,
+                        packet.exits.size()
+                );
+
+                pendingExitObjects += packet.exits.size();
 
                 double outgoing = 0.0;
 
@@ -417,6 +451,8 @@ public class AdaptiveCube {
 
                 double escapedDuringPrepare =
                         escapedEnergy - escapedBefore;
+
+                diagnostics.generatedEnergy += outgoing;
 
                 airLoss += Math.max(
                         0.0,
@@ -429,6 +465,7 @@ public class AdaptiveCube {
             for (int j = packet.exits.size() - 1; j >= 0; j--) {
 
                 SectorExit exit = packet.exits.get(j);
+                diagnostics.exitsChecked++;
 
                 // Один секторный выход разделён
                 // на три временные составляющие.
@@ -446,6 +483,7 @@ public class AdaptiveCube {
 
                     // Передача ещё не должна выйти из куба.
                     if (Math.floor(arrival) > currentTick) {
+                        diagnostics.exitsWaiting++;
                         break;
                     }
 
@@ -470,8 +508,12 @@ public class AdaptiveCube {
                                 energy * exit.dz,
                                 time
                         );
+                        diagnostics.emittedParts++;
+                        diagnostics.emittedEnergy += energy;
                     }else {
                         culledEnergy += energy;
+                        diagnostics.culledParts++;
+                        diagnostics.culledEnergy += energy;
                     }
 
                     exit.nextPart++;
@@ -488,12 +530,14 @@ public class AdaptiveCube {
                     );
 
                     packet.exits.remove(last);
+                    pendingExitObjects--;
                 }
             }
 
             // Пакет полностью покинул куб.
             if (packet.exits.isEmpty()) {
                 packets.remove(i);
+                diagnostics.completed++;
             }
         }
     }
@@ -575,6 +619,9 @@ public class AdaptiveCube {
 
     public void clear() {
         packets.clear();
+
+        pendingExitObjects = 0;
+        diagnostics.reset();
     }
 
     public int getX() {
@@ -668,6 +715,8 @@ public class AdaptiveCube {
         ox = keepInside(ox, x);
         oy = keepInside(oy, y);
         oz = keepInside(oz, z);
+        diagnostics.origins++;
+        diagnostics.directions += directions.length;
 
         for (int i = 0; i < directions.length; i++) {
             double energy = packet.energy
@@ -711,6 +760,7 @@ public class AdaptiveCube {
                 continue;
             }
 
+            diagnostics.attenuationCalls++;
             // Затухание во время прохождения куба.
             energy *= sectorTransmittance(
                     packet.energy,
@@ -815,6 +865,8 @@ public class AdaptiveCube {
                         || dx < -30000000 || dx > 30000000
                         || dz < -30000000 || dz > 30000000) {
                     escapedEnergy += partEnergy;
+                    diagnostics.escapedParts++;
+                    diagnostics.escapedEnergy += partEnergy;
                     continue;
                 }
 
@@ -826,7 +878,86 @@ public class AdaptiveCube {
                         arrival,
                         spread
                 ));
+
+                diagnostics.exitsCreated++;
             }
+        }
+    }
+
+
+    public static final class Diagnostics {
+        public long received;
+        public long prepared;
+        public long completed;
+
+        public long origins;
+        public long directions;
+        public long attenuationCalls;
+
+        public long exitsCreated;
+        public long exitsChecked;
+        public long exitsWaiting;
+
+        public long emittedParts;
+        public long culledParts;
+        public long escapedParts;
+
+        public long prepareNs;
+        public long maxPrepareNs;
+        public long maxExitsPerPacket;
+
+        public double receivedEnergy;
+        public double generatedEnergy;
+        public double emittedEnergy;
+        public double culledEnergy;
+        public double escapedEnergy;
+
+        public void add(Diagnostics other) {
+            received += other.received;
+            prepared += other.prepared;
+            completed += other.completed;
+
+            origins += other.origins;
+            directions += other.directions;
+            attenuationCalls += other.attenuationCalls;
+
+            exitsCreated += other.exitsCreated;
+            exitsChecked += other.exitsChecked;
+            exitsWaiting += other.exitsWaiting;
+
+            emittedParts += other.emittedParts;
+            culledParts += other.culledParts;
+            escapedParts += other.escapedParts;
+
+            prepareNs += other.prepareNs;
+
+            maxPrepareNs = Math.max(
+                    maxPrepareNs, other.maxPrepareNs
+            );
+
+            maxExitsPerPacket = Math.max(
+                    maxExitsPerPacket,
+                    other.maxExitsPerPacket
+            );
+
+            receivedEnergy += other.receivedEnergy;
+            generatedEnergy += other.generatedEnergy;
+            emittedEnergy += other.emittedEnergy;
+            culledEnergy += other.culledEnergy;
+            escapedEnergy += other.escapedEnergy;
+        }
+
+        public void reset() {
+            received = prepared = completed = 0;
+            origins = directions = attenuationCalls = 0;
+
+            exitsCreated = exitsChecked = exitsWaiting = 0;
+            emittedParts = culledParts = escapedParts = 0;
+
+            prepareNs = maxPrepareNs = maxExitsPerPacket = 0;
+
+            receivedEnergy = generatedEnergy = 0.0;
+            emittedEnergy = culledEnergy = escapedEnergy = 0.0;
         }
     }
 }

@@ -276,6 +276,16 @@ public class DimensionWorker {
                         }
                     }
                     long accepted = acceptedNow - acceptedAtLastReport;
+                    String adaptiveReport = physics.drainAdaptiveReport();
+
+                    if (adaptiveReport != null) {
+                        LOGGER.info(
+                                "AdaptiveCube stats: dimension={}, {}",
+                                dimensionId,
+                                adaptiveReport
+                        );
+                    }
+
                     if (accepted > 0 || snapshots > 0 || explosionAttempts > 0 || overruns > 0) {
                         LOGGER.info(
                                 "DimensionWorker stats: dimension={}, elapsedMs={}, ticks={}, accepted={}, snapshots={}, snapshotLimitHits={}, explosionAttempts={}, explosionReady={}, explosionDeferred={}, explosionLimitHits={}, queuedExplosions={}, overruns={}, snapshotTimeUs={}, explosionTimeUs={}, maxTickUs={}",
