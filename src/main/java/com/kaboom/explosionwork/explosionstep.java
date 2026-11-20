@@ -2022,7 +2022,7 @@ public class explosionstep {
         }
 
         if (processedUpdateType == WorldUpdateType.AIR
-                && ThreadLocalRandom.current().nextInt(16) != 0) {
+                && ThreadLocalRandom.current().nextInt(64) != 0) {
             return;
         }
 

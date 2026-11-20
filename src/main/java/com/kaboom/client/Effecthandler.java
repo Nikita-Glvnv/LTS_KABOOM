@@ -28,7 +28,7 @@ import java.util.Iterator;
 
 public class Effecthandler
         implements IMessageHandler<EffectMessage, IMessage> {
-    private static final int MAX_FOG = 1024;
+    private static final int MAX_FOG = 8192;
 
     private static final ArrayDeque<Fog> ACTIVE_FOG =
             new ArrayDeque<>();
@@ -54,8 +54,8 @@ public class Effecthandler
                     Math.log1p(energy) / Math.log1p(1000.0)
             );
 
-            this.lifetimeNs = 1_000_000_000L
-                    + (long) (2_000_000_000L * strength);
+            this.lifetimeNs = 10_000_000_000L
+                    + (long) (5_000_000_000L * strength);
 
             this.createdAt = System.nanoTime();
         }
@@ -227,14 +227,25 @@ public class Effecthandler
                 double cy = fog.y - camY;
                 double cz = fog.z - camZ;
 
-                if (cx * cx + cy * cy + cz * cz > 4096.0) {
+                int cameraChunkX = ((int) Math.floor(camX)) >> 4;
+                int cameraChunkZ = ((int) Math.floor(camZ)) >> 4;
+
+                int renderDistanceChunks = mc.gameSettings.renderDistanceChunks;
+                int chunkX = ((int) Math.floor(fog.x)) >> 4;
+                int chunkZ = ((int) Math.floor(fog.z)) >> 4;
+
+                if (Math.abs(chunkX - cameraChunkX) > renderDistanceChunks
+                        || Math.abs(chunkZ - cameraChunkZ) > renderDistanceChunks
+                        || mc.world.getChunkProvider().getLoadedChunk(
+                        chunkX, chunkZ
+                ) == null) {
                     continue;
                 }
 
                 // Последние 20% времени куб постепенно исчезает.
                 double fade = Math.min(1.0, (1.0 - age) * 5.0);
 
-                int alpha = (int) (65.0 * fade);
+                int alpha = (int) (18.0 * fade);
 
                 renderFogCube(
                         buffer,
