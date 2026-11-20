@@ -5,6 +5,8 @@ import java.util.ArrayDeque;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import com.kaboom.server.EntitySnapshot;
 import java.util.List;
+import com.kaboom.server.DestroyApplyManager.WorldUpdateType;
+import java.util.concurrent.ThreadLocalRandom;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
@@ -688,8 +690,9 @@ public class AdaptiveCube {
             long tick,
             EnergyOutput output,
             List<EntitySnapshot.Hitbox> hitboxes,
-            explosionstep.DamageSink damageSink
-    ) {
+            explosionstep.DamageSink damageSink,
+            explosionstep.WorldUpdateSink worldUpdateSink
+    ){
         if (tick < 0 || output == null)
             throw new IllegalArgumentException("Invalid process args");
         if (previousTick != Long.MIN_VALUE && tick != previousTick + 1)
@@ -779,6 +782,25 @@ public class AdaptiveCube {
                         }
                     }
                 }
+            }
+            if (worldUpdateSink != null
+                    && scratch.energy > 0.0
+                    && ThreadLocalRandom.current().nextInt(16) == 0) {
+
+                int volume = size * size * size;
+
+                // Равномерно выбираем одну клетку макрокуба.
+                int cell = ThreadLocalRandom.current().nextInt(volume);
+
+                int bx = x + cell % size;
+                int by = y + (cell / size) % size;
+                int bz = z + cell / (size * size);
+
+                worldUpdateSink.update(
+                        bx, by, bz,
+                        WorldUpdateType.AIR,
+                        scratch.energy / volume
+                );
             }
             prepare(scratch);
             long nanos = System.nanoTime() - start;

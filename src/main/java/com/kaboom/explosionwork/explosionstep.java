@@ -15,6 +15,8 @@ import java.util.Iterator;
 import com.kaboom.server.EntitySnapshot;
 import java.util.List;
 import java.util.UUID;
+import com.kaboom.server.DestroyApplyManager.WorldUpdateType;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class explosionstep {
     private static final double MIN_ACTIVE_ENERGY = 1e-5;
@@ -42,6 +44,9 @@ public class explosionstep {
     private static final double[] UX = new double[DIRECTIONS];
     private static final double[] UY = new double[DIRECTIONS];
     private static final double[] UZ = new double[DIRECTIONS];
+
+    private WorldUpdateSink worldUpdateSink;
+    private WorldUpdateType processedUpdateType;
 
     private static final double[] LENGTH = {
             0.0, 1.0, Math.sqrt(2.0), Math.sqrt(3.0)
@@ -76,6 +81,15 @@ public class explosionstep {
     @FunctionalInterface
     public interface DamageSink {
         void hit(int entityId, UUID uuid, int partIndex, double damage);
+    }
+
+    @FunctionalInterface
+    public interface WorldUpdateSink {
+        void update(
+                int x, int y, int z,
+                WorldUpdateType type,
+                double energy
+        );
     }
 
     private DamageSink damageSink;
@@ -886,6 +900,7 @@ public class explosionstep {
     ) {
         handedToMacro = false;
         double incident = b.energy[c];
+        processedUpdateType = null;
 
         if (incident <= 0.0) {
             return true;
@@ -996,6 +1011,10 @@ public class explosionstep {
         double reflect = 0.0;
         double spent = 0.0;
 
+        processedUpdateType = (wall || liquid)
+                ? WorldUpdateType.SOLID_OR_LIQUID
+                : WorldUpdateType.AIR;
+
         // Взаимодействие с твёрдым блоком.
         if (wall) {
 
@@ -1054,6 +1073,12 @@ public class explosionstep {
             }
         }
 
+        // Если выполнение дошло сюда, твёрдый блок разрушен.
+// Выжившие твёрдые блоки уже вышли через return true.
+        if (wall) {
+            processedUpdateType = null;
+        }
+
         boolean liquidDestroyed = false;
 
         if (liquid) {
@@ -1065,14 +1090,15 @@ public class explosionstep {
             );
 
             if (absorption > LIQUID_DESTRUCTION_THRESHOLD) {
-
                 liquidDestroyed = true;
-                spent = LIQUID_DESTRUCTION_THRESHOLD;
+                processedUpdateType = null;
 
+                spent = LIQUID_DESTRUCTION_THRESHOLD;
             } else {
 
                 spent = absorption;
             }
+
         }
 
         // Блок либо отсутствует, либо будет разрушен.
@@ -1340,8 +1366,9 @@ public class explosionstep {
 
     public boolean step(
             SnapshotManager snapshots,
-            DamageSink damageSink
-    ) {
+            DamageSink damageSink,
+            WorldUpdateSink worldUpdateSink
+    ){
 
         if (awaitingDestructionApply) {
             throw new IllegalStateException(
@@ -1350,6 +1377,7 @@ public class explosionstep {
         }
 
         this.damageSink = damageSink;
+        this.worldUpdateSink = worldUpdateSink;
         this.entityFrame = snapshots.getEntitySnapshot();
 
         lastEntitySection = Long.MIN_VALUE;
@@ -1398,6 +1426,7 @@ public class explosionstep {
             } else if (!handedToMacro) {
 
                 damageCell(bucket, nextCell);
+                emitCellUpdate(bucket, nextCell);
             }
 
             nextCell++;
@@ -1778,7 +1807,8 @@ public class explosionstep {
                     currentTick,
                     this::emitAt,
                     hitboxes,
-                    damageSink
+                    damageSink,
+                    worldUpdateSink
             );
 
             long durationNs = System.nanoTime() - startNs;
@@ -1984,5 +2014,26 @@ public class explosionstep {
                 );
             }
         }
+    }
+
+    private void emitCellUpdate(WaveBucket bucket, int cell) {
+        if (worldUpdateSink == null || processedUpdateType == null) {
+            return;
+        }
+
+        if (processedUpdateType == WorldUpdateType.AIR
+                && ThreadLocalRandom.current().nextInt(16) != 0) {
+            return;
+        }
+
+        long pos = bucket.position[cell];
+
+        worldUpdateSink.update(
+                unpackX(pos),
+                unpackY(pos),
+                unpackZ(pos),
+                processedUpdateType,
+                bucket.energy[cell]
+        );
     }
 }

@@ -20,14 +20,24 @@ import java.util.UUID;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import net.minecraft.block.material.Material;
+import net.minecraft.block.state.IBlockState;
+import net.minecraft.util.EnumFacing;
+import com.kaboom.network.EffectMessage;
 
 import static com.kaboom.ModLogger.LOGGER;
 
 public class DestroyApplyManager {
+    private static final int MAX_WORLD_UPDATE_REQUESTS = 65536;
     private static final int MAX_DESTROY_REQUESTS = 16384;
     private static final int MAX_DESTROYS_PER_TICK = 256;
     private static final long MAX_APPLY_NANOS = 2_000_000L;
     private static final int MAX_DAMAGE_REQUESTS = 16384;
+    private static final int MAX_WORLD_UPDATES_PER_TICK = 512;
+    private static final long MAX_WORLD_UPDATE_NANOS = 2_000_000L;
+
+    private static final double MAX_IGNITION_CHANCE = 0.25;
+    private static final double IGNITION_ENERGY_SCALE = 100.0;
 
     private final BlockingQueue<DamageRequest> damageQueue =
             new ArrayBlockingQueue<>(MAX_DAMAGE_REQUESTS);
@@ -37,6 +47,15 @@ public class DestroyApplyManager {
 
     private final BlockDestroyPackage blockDestroyPackage =
             new BlockDestroyPackage();
+
+    private final BlockingQueue<WorldUpdateRequest> worldUpdateQueue =
+            new ArrayBlockingQueue<>(MAX_WORLD_UPDATE_REQUESTS);
+
+    public enum WorldUpdateType {
+        EXPLOSION_CENTER,
+        AIR,
+        SOLID_OR_LIQUID
+    }
 
     private static final class DestroyRequest {
         final int dimensionId;
@@ -66,6 +85,7 @@ public class DestroyApplyManager {
         try {
             processDestroyQueue(start);
             processDamageQueue();
+            processWorldUpdateQueue();
 
             // Здесь позже появятся другие очереди.
         } finally {
@@ -79,6 +99,9 @@ public class DestroyApplyManager {
                 request -> request.dimensionId == dimensionId
         );
         damageQueue.removeIf(
+                request -> request.dimensionId == dimensionId
+        );
+        worldUpdateQueue.removeIf(
                 request -> request.dimensionId == dimensionId
         );
     }
@@ -361,4 +384,164 @@ public class DestroyApplyManager {
         }
     }
 
+    private static final class WorldUpdateRequest {
+        final int dimensionId;
+        final int x, y, z;
+        final WorldUpdateType type;
+        final double energy;
+
+        WorldUpdateRequest(
+                int dimensionId,
+                int x, int y, int z,
+                WorldUpdateType type,
+                double energy
+        ) {
+            this.dimensionId = dimensionId;
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.type = type;
+            this.energy = energy;
+        }
+    }
+
+    public boolean submitWorldUpdate(
+            int dimensionId,
+            int x, int y, int z,
+            WorldUpdateType type,
+            double energy
+    ) {
+        Objects.requireNonNull(type, "type");
+
+        if (!Double.isFinite(energy) || energy < 0.0) {
+            throw new IllegalArgumentException(
+                    "Invalid world update energy"
+            );
+        }
+
+        return worldUpdateQueue.offer(
+                new WorldUpdateRequest(
+                        dimensionId,
+                        x, y, z,
+                        type,
+                        energy
+                )
+        );
+    }
+
+    private void processWorldUpdateQueue() {
+        long start = System.nanoTime();
+
+        for (int i = 0; i < MAX_WORLD_UPDATES_PER_TICK; i++) {
+
+            if (System.nanoTime() - start >= MAX_WORLD_UPDATE_NANOS) {
+                break;
+            }
+
+            WorldUpdateRequest request = worldUpdateQueue.poll();
+
+            if (request == null) {
+                break;
+            }
+
+            try {
+                switch (request.type) {
+
+                    case EXPLOSION_CENTER:
+                        blockDestroyPackage.recordEffect(
+                                request.dimensionId,
+                                request.x,
+                                request.y,
+                                request.z,
+                                EffectMessage.EXPLOSION_CENTER,
+                                request.energy
+                        );
+                        break;
+
+                    case AIR:
+                        blockDestroyPackage.recordEffect(
+                                request.dimensionId,
+                                request.x,
+                                request.y,
+                                request.z,
+                                EffectMessage.AIR,
+                                request.energy
+                        );
+                        break;
+
+                    case SOLID_OR_LIQUID:
+                        applyBlockUpdate(request);
+                        break;
+                }
+
+            } catch (RuntimeException e) {
+                LOGGER.error(
+                        "Failed to apply world update: dimension={}, pos=({}, {}, {}), type={}",
+                        request.dimensionId,
+                        request.x,
+                        request.y,
+                        request.z,
+                        request.type,
+                        e
+                );
+            }
+        }
+    }
+
+    private void applyBlockUpdate(WorldUpdateRequest request) {
+
+        WorldServer world = DimensionManager.getWorld(
+                request.dimensionId, false
+        );
+
+        if (world == null || request.y < 0 || request.y >= 256) {
+            return;
+        }
+
+        if (world.getChunkProvider().getLoadedChunk(
+                request.x >> 4,
+                request.z >> 4
+        ) == null) {
+            return;
+        }
+
+        BlockPos pos = new BlockPos(
+                request.x, request.y, request.z
+        );
+
+        IBlockState state = world.getBlockState(pos);
+
+        if (state.getMaterial() == Material.AIR) {
+            return;
+        }
+
+        // Обновляем сам блок, не рассылая напрямую
+        // уведомления соседним блокам.
+        world.scheduleUpdate(pos, state.getBlock(), 1);
+
+        // Вероятность поджога зависит от энергии.
+        double chance = MAX_IGNITION_CHANCE
+                * request.energy
+                / (request.energy + IGNITION_ENERGY_SCALE);
+
+        if (request.y >= 255
+                || world.rand.nextDouble() >= chance
+                || !state.getBlock().isFlammable(
+                world, pos, EnumFacing.UP
+        )) {
+            return;
+        }
+
+        BlockPos firePos = pos.up();
+
+        if (world.isAirBlock(firePos)
+                && Blocks.FIRE.canPlaceBlockAt(world, firePos)) {
+
+            world.setBlockState(
+                    firePos,
+                    Blocks.FIRE.getDefaultState(),
+                    2
+            );
+        }
+    }
 }

@@ -146,12 +146,13 @@ public class DimensionWorker {
                 start = System.nanoTime();
 
                 boolean waveWasActive =
-                        physics.hasPending() || pendingDestroyApply || !pendingDamage.isEmpty();
+                        physics.hasPending() || pendingDestroyApply || !pendingDamage.isEmpty()|| !pendingWorldUpdates.isEmpty();
 
 // Нельзя рассчитывать следующий шаг, пока
 // разрушения предыдущего не переданы серверу.
                 if (flushPendingDamage()
-                        && (!pendingDestroyApply || applyPendingDestructions()))  {
+                        && flushPendingWorldUpdates()
+                        && (!pendingDestroyApply || applyPendingDestructions())) {
 
                     // Регистрируем новые источники энергии.
                     processPendingExplosions();
@@ -164,8 +165,11 @@ public class DimensionWorker {
 
                         long physicsStart = System.nanoTime();
 
-                        boolean finished =
-                                physics.step(snapshotManager, damageSink);
+                        boolean finished = physics.step(
+                                snapshotManager,
+                                damageSink,
+                                worldUpdateSink
+                        );
 
                         int activeCells = physics.getCellsLastStep();
 
@@ -211,7 +215,7 @@ public class DimensionWorker {
                                 && attemptsThisTick == 0
                                 && !waveWasActive
                                 && !physics.hasPending()
-                                && !pendingDestroyApply;
+                                && !pendingDestroyApply && pendingWorldUpdates.isEmpty();
                 if (idle != wasIdle && pendingDamage.isEmpty()) {
                     LOGGER.debug("DimensionWorker state: dimension={}, state={}",
                             dimensionId, idle ? "idle" : "active");
@@ -394,6 +398,13 @@ public class DimensionWorker {
                     0.0,
                     arrival
             );
+            submitWorldUpdate(
+                    pos.getX(),
+                    pos.getY(),
+                    pos.getZ(),
+                    DestroyApplyManager.WorldUpdateType.EXPLOSION_CENTER,
+                    request.power
+            );
             LOGGER.info(
                     "ExplosionPhysics source activated: dimension={}, " +
                             "pos={}, energy={}, arrivalTick={}",
@@ -574,6 +585,84 @@ public class DimensionWorker {
             }
 
             pendingDamage.removeFirst();
+        }
+
+        return true;
+    }
+
+    private static final class PendingWorldUpdate {
+        final int x, y, z;
+        final DestroyApplyManager.WorldUpdateType type;
+        final double energy;
+
+        PendingWorldUpdate(
+                int x, int y, int z,
+                DestroyApplyManager.WorldUpdateType type,
+                double energy
+        ) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.type = type;
+            this.energy = energy;
+        }
+    }
+
+    private final ArrayDeque<PendingWorldUpdate> pendingWorldUpdates =
+            new ArrayDeque<>();
+
+    private final explosionstep.WorldUpdateSink worldUpdateSink =
+            this::submitWorldUpdate;
+
+    private void submitWorldUpdate(
+            int x, int y, int z,
+            DestroyApplyManager.WorldUpdateType type,
+            double energy
+    ) {
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (pendingWorldUpdates.isEmpty()
+                && manager != null
+                && manager.submitWorldUpdate(
+                dimensionId, x, y, z, type, energy
+        )) {
+            return;
+        }
+
+        pendingWorldUpdates.addLast(
+                new PendingWorldUpdate(x, y, z, type, energy)
+        );
+    }
+
+    private boolean flushPendingWorldUpdates() {
+        if (pendingWorldUpdates.isEmpty()) {
+            return true;
+        }
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (manager == null) {
+            return false;
+        }
+
+        while (!pendingWorldUpdates.isEmpty()) {
+            PendingWorldUpdate request =
+                    pendingWorldUpdates.peekFirst();
+
+            if (!manager.submitWorldUpdate(
+                    dimensionId,
+                    request.x,
+                    request.y,
+                    request.z,
+                    request.type,
+                    request.energy
+            )) {
+                return false;
+            }
+
+            pendingWorldUpdates.removeFirst();
         }
 
         return true;
