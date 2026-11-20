@@ -2,10 +2,16 @@ package com.kaboom.client;
 
 import com.kaboom.network.EffectMessage;
 
+import com.kaboom.sound.ExplosionAcoustics;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.WorldClient;
 import net.minecraft.init.SoundEvents;
 import net.minecraft.util.SoundCategory;
+import com.kaboom.sound.KaboomSounds;
+import com.kaboom.sound.ExplosionAcoustics;
+
+import net.minecraft.client.audio.ISound;
+import net.minecraft.client.audio.PositionedSound;
 
 import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
 import net.minecraftforge.fml.common.network.simpleimpl.IMessageHandler;
@@ -81,13 +87,6 @@ public class Effecthandler
             return;
         }
 
-        if (world.getChunkProvider().getLoadedChunk(
-                message.getChunkX(),
-                message.getChunkZ()
-        ) == null) {
-            return;
-        }
-
         for (int i = 0; i < message.getCount(); i++) {
 
             int x = message.getX(i);
@@ -99,30 +98,76 @@ public class Effecthandler
             switch (message.getType(i)) {
 
                 case EffectMessage.EXPLOSION_CENTER:
-                    playExplosionSound(world, x, y, z);
+                    playExplosionSound(x, y, z, energy);
                     break;
 
                 case EffectMessage.AIR:
-                    spawnWhiteFog(world, x, y, z, energy);
+                    if (world.getChunkProvider().getLoadedChunk(
+                            message.getChunkX(),
+                            message.getChunkZ()
+                    ) != null) {
+                        spawnWhiteFog(world, x, y, z, energy);
+                    }
                     break;
             }
         }
     }
 
     private static void playExplosionSound(
-            WorldClient world,
-            int x, int y, int z
+            int x, int y, int z,
+            double energy
     ) {
-        world.playSound(
-                x + 0.5,
-                y + 0.5,
-                z + 0.5,
-                SoundEvents.ENTITY_GENERIC_EXPLODE,
-                SoundCategory.BLOCKS,
-                4.0F,
-                1.0F,
-                true
+        Minecraft mc = Minecraft.getMinecraft();
+
+        if (mc.player == null) {
+            return;
+        }
+
+        double sx = x + 0.5;
+        double sy = y + 0.5;
+        double sz = z + 0.5;
+
+        double distance = mc.player.getDistance(sx, sy, sz);
+
+        if (distance >= ExplosionAcoustics.radius(energy)) {
+            return;
+        }
+
+        // 20 блоков/сек при 20 TPS = 1 тик на блок.
+        int delayTicks = (int) Math.ceil(distance);
+
+        // Основной звук на любой слышимой дистанции.
+        mc.getSoundHandler().playDelayedSound(
+                new ExplosionSound(sx, sy, sz, energy, 1.0F, 1.0F),
+                delayTicks
         );
+
+// Дополнительное усиление на расстоянии до 32 блоков.
+        if (distance < 32.0) {
+
+            double t = 1.0 - distance / 32.0;
+
+            // Плавное уменьшение дополнительной громкости.
+            double boost = t * t * (3.0 - 2.0 * t);
+
+            mc.getSoundHandler().playDelayedSound(
+                    new ExplosionSound(
+                            sx, sy, sz, energy,
+                            (float) (0.8 * boost),
+                            0.97F
+                    ),
+                    delayTicks
+            );
+
+            mc.getSoundHandler().playDelayedSound(
+                    new ExplosionSound(
+                            sx, sy, sz, energy,
+                            (float) (0.6 * boost),
+                            1.03F
+                    ),
+                    delayTicks
+            );
+        }
     }
 
     private static void spawnWhiteFog(
@@ -330,5 +375,66 @@ public class Effecthandler
         fogVertex(b, x1, y, z1, alpha);
         fogVertex(b, x1, y1, z1, alpha);
         fogVertex(b, x, y1, z1, alpha);
+    }
+
+    private static final class ExplosionSound extends PositionedSound {
+        private final float gain;
+        private final float pitchMultiplier;
+
+        private final double sourceX;
+        private final double sourceY;
+        private final double sourceZ;
+        private final double energy;
+
+        ExplosionSound(
+                double x, double y, double z,
+                double energy,
+                float gain,
+                float pitchMultiplier
+        ) {
+            super(KaboomSounds.EXPLOSION, SoundCategory.BLOCKS);
+
+            this.sourceX = x;
+            this.sourceY = y;
+            this.sourceZ = z;
+            this.energy = energy;
+
+            this.gain = gain;
+            this.pitchMultiplier = pitchMultiplier;
+
+            this.xPosF = (float) x;
+            this.yPosF = (float) y;
+            this.zPosF = (float) z;
+
+            this.attenuationType = ISound.AttenuationType.NONE;
+        }
+
+        private double listenerDistance() {
+            Minecraft mc = Minecraft.getMinecraft();
+
+            if (mc.player == null) {
+                return ExplosionAcoustics.radius(energy);
+            }
+
+            return mc.player.getDistance(
+                    sourceX, sourceY, sourceZ
+            );
+        }
+
+        @Override
+        public float getVolume() {
+            return ExplosionAcoustics.volume(
+                    listenerDistance(),
+                    energy
+            ) * gain;
+        }
+
+        @Override
+        public float getPitch() {
+            return ExplosionAcoustics.pitch(
+                    listenerDistance(),
+                    energy
+            ) * pitchMultiplier;
+        }
     }
 }

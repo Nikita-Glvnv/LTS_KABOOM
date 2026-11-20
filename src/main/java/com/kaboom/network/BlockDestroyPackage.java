@@ -3,6 +3,7 @@ package com.kaboom.network;
 import com.kaboom.Kaboom;
 import com.kaboom.client.BlockDestroyHandler;
 import com.kaboom.client.Effecthandler;
+import com.kaboom.sound.ExplosionAcoustics;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraftforge.fml.common.FMLCommonHandler;
@@ -252,6 +253,40 @@ public class BlockDestroyPackage {
             throw new IllegalArgumentException(
                     "Invalid effect type"
             );
+        }
+        if (type == EffectMessage.EXPLOSION_CENTER) {
+            int chunkX = x >> 4;
+            int chunkZ = z >> 4;
+
+            short packed = (short) (
+                    ((y & 255) << 8)
+                            | ((z & 15) << 4)
+                            | (x & 15)
+            );
+
+            EffectMessage message = new EffectMessage(
+                    dimensionId,
+                    chunkX,
+                    chunkZ,
+                    new short[]{packed},
+                    new byte[]{EffectMessage.EXPLOSION_CENTER},
+                    new double[]{energy},
+                    0,
+                    1
+            );
+
+            CHANNEL.sendToAllAround(
+                    message,
+                    new NetworkRegistry.TargetPoint(
+                            dimensionId,
+                            x + 0.5,
+                            y + 0.5,
+                            z + 0.5,
+                            ExplosionAcoustics.radius(energy)
+                    )
+            );
+
+            return;
         }
 
         int chunkX = x >> 4;

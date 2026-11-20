@@ -1,0 +1,7 @@
+{
+  "explosion": {
+    "sounds": [
+      { "name": "lts_kaboom:explosion", "stream": true }
+    ]
+  }
+}
