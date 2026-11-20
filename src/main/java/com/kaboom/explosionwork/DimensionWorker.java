@@ -110,11 +110,6 @@ public class DimensionWorker {
         long physicsDeferredCells = 0;
         long physicsDestroyedBlocks = 0;
         long physicsPrefetchChecks = 0;
-        long physicsMacroAttempts = 0;
-        long physicsMacroTransfers = 0;
-        long physicsMacroHops = 0;
-        long physicsMacroEight = 0;
-        long physicsMacroSixteen = 0;
 
         long physicsTimeNs = 0;
         long maxPhysicsStepNs = 0;

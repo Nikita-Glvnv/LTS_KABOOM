@@ -756,9 +756,9 @@ public class AdaptiveCube {
             long start = System.nanoTime();
             if (damageBoxCount > 0) {
 
-                double damage = scratch.energy
-                        * explosionstep.ENTITY_DAMAGE_SCALE
-                        / (size * size * size);
+                double damage = explosionstep.entityDamage(
+                        scratch.energy / (size * size * size)
+                );
 
                 if (Double.isFinite(damage) && damage > 0.0) {
 

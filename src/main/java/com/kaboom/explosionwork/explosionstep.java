@@ -66,6 +66,13 @@ public class explosionstep {
 
     static final double ENTITY_DAMAGE_SCALE = 1;
 
+    static double entityDamage(double energy) {
+        double t = 1.0 + energy;
+
+        return energy * ENTITY_DAMAGE_SCALE
+                * (1.0 + 9.0 / (t * t));
+    }
+
     @FunctionalInterface
     public interface DamageSink {
         void hit(int entityId, UUID uuid, int partIndex, double damage);
@@ -1959,7 +1966,7 @@ public class explosionstep {
             return;
         }
 
-        double damage = energy * ENTITY_DAMAGE_SCALE;
+        double damage = entityDamage(energy);
 
         if (!Double.isFinite(damage) || damage <= 0.0) {
             return;
