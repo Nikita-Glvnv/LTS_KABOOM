@@ -5,6 +5,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.WorldClient;
 import net.minecraft.init.Blocks;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.EnumParticleTypes;
 
 import net.minecraftforge.fml.common.network.simpleimpl.IMessage;
 import net.minecraftforge.fml.common.network.simpleimpl.IMessageHandler;
@@ -64,6 +65,22 @@ public class BlockDestroyHandler
                     Blocks.AIR.getDefaultState(),
                     2
             );
+
+            for (int i = 0; i < 2; i++) {
+                world.spawnParticle(
+                        EnumParticleTypes.EXPLOSION_NORMAL,
+
+                        x + world.rand.nextDouble(),
+                        y + world.rand.nextDouble(),
+                        z + world.rand.nextDouble(),
+
+                        (world.rand.nextDouble() - 0.5) * 0.08,
+                        world.rand.nextDouble() * 0.05,
+                        (world.rand.nextDouble() - 0.5) * 0.08
+                );
+            }
         }
     }
+
+
 }

@@ -14,6 +14,7 @@ import com.kaboom.server.DestroyApplyManager;
 import net.minecraft.util.math.BlockPos;
 
 public class DimensionWorker {
+    private static final boolean AIR_EFFECTS_ENABLED = false;
     private final int dimensionId;
     private final SnapshotManager snapshotManager;
     private final explosionstep physics = new explosionstep();
@@ -621,6 +622,11 @@ public class DimensionWorker {
     ) {
         DestroyApplyManager manager =
                 Kaboom.getDestroyApplyManager();
+
+        if (type == DestroyApplyManager.WorldUpdateType.AIR
+                && !AIR_EFFECTS_ENABLED) {
+            return;
+        }
 
         if (pendingWorldUpdates.isEmpty()
                 && manager != null
