@@ -29,8 +29,6 @@ import java.util.Iterator;
 public class Effecthandler
         implements IMessageHandler<EffectMessage, IMessage> {
     private static final int MAX_FOG = 1024;
-    private static final int FOG_SEGMENTS = 20;
-    private static final long FOG_LIFETIME_NS = 900_000_000L;
 
     private static final ArrayDeque<Fog> ACTIVE_FOG =
             new ArrayDeque<>();
@@ -43,7 +41,7 @@ public class Effecthandler
 
     private static final class Fog {
         final double x, y, z;
-        final double radius;
+        final long lifetimeNs;
         final long createdAt;
 
         Fog(double x, double y, double z, double energy) {
@@ -51,10 +49,13 @@ public class Effecthandler
             this.y = y;
             this.z = z;
 
-            this.radius = Math.min(
-                    2.0,
-                    0.7 + 0.16 * Math.log1p(energy)
+            double strength = Math.min(
+                    1.0,
+                    Math.log1p(energy) / Math.log1p(1000.0)
             );
+
+            this.lifetimeNs = 1_000_000_000L
+                    + (long) (2_000_000_000L * strength);
 
             this.createdAt = System.nanoTime();
         }
@@ -184,21 +185,6 @@ public class Effecthandler
         double camZ = camera.lastTickPosZ
                 + (camera.posZ - camera.lastTickPosZ) * partial;
 
-        double yaw = Math.toRadians(
-                camera.prevRotationYaw
-                        + (camera.rotationYaw - camera.prevRotationYaw)
-                        * partial
-        );
-
-        Vec3d look = camera.getLook(partial);
-
-        double rightX = Math.cos(yaw);
-        double rightZ = Math.sin(yaw);
-
-        double upX = -look.y * rightZ;
-        double upY = look.z * rightX - look.x * rightZ;
-        double upZ = look.y * rightX;
-
         Tessellator tessellator = Tessellator.getInstance();
         BufferBuilder buffer = tessellator.getBuffer();
 
@@ -213,11 +199,11 @@ public class Effecthandler
         GlStateManager.disableCull();
         GlStateManager.disableAlpha();
         GlStateManager.depthMask(false);
-        GlStateManager.shadeModel(GL11.GL_SMOOTH);
+        GlStateManager.shadeModel(GL11.GL_FLAT);
 
         try {
             buffer.begin(
-                    GL11.GL_TRIANGLES,
+                    GL11.GL_QUADS,
                     DefaultVertexFormats.POSITION_COLOR
             );
 
@@ -230,7 +216,7 @@ public class Effecthandler
                 Fog fog = iterator.next();
 
                 double age = (double) (now - fog.createdAt)
-                        / FOG_LIFETIME_NS;
+                        / fog.lifetimeNs;
 
                 if (age >= 1.0) {
                     iterator.remove();
@@ -245,28 +231,18 @@ public class Effecthandler
                     continue;
                 }
 
-                int alpha = (int) (65.0 * (1.0 - age));
+                // Последние 20% времени куб постепенно исчезает.
+                double fade = Math.min(1.0, (1.0 - age) * 5.0);
 
-                for (int i = 0; i < FOG_SEGMENTS; i++) {
-                    double a0 = 2.0 * Math.PI * i / FOG_SEGMENTS;
-                    double a1 = 2.0 * Math.PI * (i + 1) / FOG_SEGMENTS;
+                int alpha = (int) (65.0 * fade);
 
-                    buffer.pos(cx, cy, cz)
-                            .color(255, 255, 255, alpha)
-                            .endVertex();
-
-                    fogVertex(
-                            buffer, cx, cy, cz,
-                            rightX, rightZ, upX, upY, upZ,
-                            fog.radius, a0
-                    );
-
-                    fogVertex(
-                            buffer, cx, cy, cz,
-                            rightX, rightZ, upX, upY, upZ,
-                            fog.radius, a1
-                    );
-                }
+                renderFogCube(
+                        buffer,
+                        cx - 0.5,
+                        cy - 0.5,
+                        cz - 0.5,
+                        alpha
+                );
 
                 hasVertices = true;
             }
@@ -291,19 +267,57 @@ public class Effecthandler
 
     private static void fogVertex(
             BufferBuilder buffer,
-            double cx, double cy, double cz,
-            double rightX, double rightZ,
-            double upX, double upY, double upZ,
-            double radius,
-            double angle
+            double x, double y, double z,
+            int alpha
     ) {
-        double c = Math.cos(angle);
-        double s = Math.sin(angle);
+        buffer.pos(x, y, z)
+                .color(255, 255, 255, alpha)
+                .endVertex();
+    }
 
-        buffer.pos(
-                cx + radius * (rightX * c + upX * s),
-                cy + radius * upY * s,
-                cz + radius * (rightZ * c + upZ * s)
-        ).color(255, 255, 255, 0).endVertex();
+    private static void renderFogCube(
+            BufferBuilder b,
+            double x, double y, double z,
+            int alpha
+    ) {
+        double x1 = x + 1.0;
+        double y1 = y + 1.0;
+        double z1 = z + 1.0;
+
+        // Левая грань
+        fogVertex(b, x, y, z, alpha);
+        fogVertex(b, x, y, z1, alpha);
+        fogVertex(b, x, y1, z1, alpha);
+        fogVertex(b, x, y1, z, alpha);
+
+        // Правая грань
+        fogVertex(b, x1, y, z1, alpha);
+        fogVertex(b, x1, y, z, alpha);
+        fogVertex(b, x1, y1, z, alpha);
+        fogVertex(b, x1, y1, z1, alpha);
+
+        // Нижняя грань
+        fogVertex(b, x, y, z1, alpha);
+        fogVertex(b, x, y, z, alpha);
+        fogVertex(b, x1, y, z, alpha);
+        fogVertex(b, x1, y, z1, alpha);
+
+        // Верхняя грань
+        fogVertex(b, x, y1, z, alpha);
+        fogVertex(b, x, y1, z1, alpha);
+        fogVertex(b, x1, y1, z1, alpha);
+        fogVertex(b, x1, y1, z, alpha);
+
+        // Передняя грань
+        fogVertex(b, x1, y, z, alpha);
+        fogVertex(b, x, y, z, alpha);
+        fogVertex(b, x, y1, z, alpha);
+        fogVertex(b, x1, y1, z, alpha);
+
+        // Задняя грань
+        fogVertex(b, x, y, z1, alpha);
+        fogVertex(b, x1, y, z1, alpha);
+        fogVertex(b, x1, y1, z1, alpha);
+        fogVertex(b, x, y1, z1, alpha);
     }
 }
