@@ -2,6 +2,7 @@ package com.kaboom.network;
 
 import com.kaboom.Kaboom;
 import com.kaboom.client.BlockDestroyHandler;
+import com.kaboom.client.Effecthandler;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraftforge.fml.common.FMLCommonHandler;
@@ -82,12 +83,21 @@ public class BlockDestroyPackage {
                     Side.CLIENT
             );
         }
-        CHANNEL.registerMessage(
-                EffectMessage.Handler.class,
-                EffectMessage.class,
-                1,
-                Side.CLIENT
-        );
+        if (FMLCommonHandler.instance().getSide().isClient()) {
+            CHANNEL.registerMessage(
+                    Effecthandler.class,
+                    EffectMessage.class,
+                    1,
+                    Side.CLIENT
+            );
+        } else {
+            CHANNEL.registerMessage(
+                    EffectMessage.Handler.class,
+                    EffectMessage.class,
+                    1,
+                    Side.CLIENT
+            );
+        }
     }
 
     public void flush() {
