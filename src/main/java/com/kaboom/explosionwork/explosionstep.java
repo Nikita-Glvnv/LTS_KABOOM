@@ -69,15 +69,15 @@ public class explosionstep {
     private final Long2ObjectOpenHashMap<AdaptiveCube> macroSixteen =
             new Long2ObjectOpenHashMap<>();
 
-    static final double ENTITY_DAMAGE_SCALE = 1;
-
     static double entityDamage(double energy) {
-        double t = 1.0 + energy;
+        if (energy <= 0.0) {
+            return 0.0;
+        }
 
-        return energy * ENTITY_DAMAGE_SCALE
-                * (1.0 + 9.0 / (t * t));
+        return 8.0
+                * (energy / (energy + 0.1))
+                * Math.sqrt(1.0 + energy / 25.0);
     }
-
     @FunctionalInterface
     public interface DamageSink {
         void hit(int entityId, UUID uuid, int partIndex, double damage);
