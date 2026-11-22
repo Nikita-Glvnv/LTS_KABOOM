@@ -4,6 +4,7 @@ import net.minecraft.entity.Entity;
 import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.WorldServer;
+import net.minecraft.entity.EntityLivingBase;
 
 import java.util.*;
 
@@ -13,6 +14,7 @@ public class EntitySnapshot {
         public final int entityId;
         public final UUID entityUuid;
         public final int partIndex;
+        public final int armor;
 
         public final double minX, minY, minZ;
         public final double maxX, maxY, maxZ;
@@ -21,6 +23,9 @@ public class EntitySnapshot {
             this.entityId = parent.getEntityId();
             this.entityUuid = parent.getUniqueID();
             this.partIndex = partIndex;
+            this.armor = parent instanceof EntityLivingBase
+                    ? ((EntityLivingBase) parent).getTotalArmorValue()
+                    : 0;
 
             this.minX = bb.minX;
             this.minY = bb.minY;

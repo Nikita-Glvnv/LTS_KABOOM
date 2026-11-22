@@ -967,6 +967,7 @@ public class explosionstep {
                 return true;
             }
         }
+        double transmission = entityTransmission(x, y, z);
 
         boolean wall;
         boolean liquid;
@@ -1033,7 +1034,7 @@ public class explosionstep {
             if (h < 0.0
                     || incident * (1.0 - reflect) < destructionThreshold) {
 
-                absorbed += incident * (1.0 - reflect);
+                absorbed += incident * reflect * (1.0 - transmission);
 
                 double meanArrival =
                         b.arrivalSum[c] / incident;
@@ -1061,10 +1062,10 @@ public class explosionstep {
                     emit(
                             src,
                             src,
-                            b.linkEnergy[link] * reflect,
-                            -b.linkMomentX[link] * reflect,
-                            -b.linkMomentY[link] * reflect,
-                            -b.linkMomentZ[link] * reflect,
+                            b.linkEnergy[link] * reflect * transmission,
+                            -b.linkMomentX[link] * reflect * transmission,
+                            -b.linkMomentY[link] * reflect * transmission,
+                            -b.linkMomentZ[link] * reflect * transmission,
                             meanArrival + returnDistance
                     );
                 }
@@ -1103,6 +1104,10 @@ public class explosionstep {
 
         // Блок либо отсутствует, либо будет разрушен.
         double available = incident - spent;
+        double entityLoss = available * (1.0 - transmission);
+
+        absorbed += entityLoss;
+        available -= entityLoss;
 
         if (available <= 0.0) {
             recordMaterialInteraction(
@@ -1841,6 +1846,7 @@ public class explosionstep {
 
 // Существующий учёт энергетических потерь.
             airAbsorbed += cube.takeAirLoss();
+            absorbed += cube.takeEntityLoss();
             escaped += cube.takeEscapedEnergy();
             culled += cube.takeCulledEnergy();
 
@@ -1962,7 +1968,9 @@ public class explosionstep {
             return null;
         }
 
-        long key = pack(x >> 4, y >> 4, z >> 4);
+        long key = EntitySnapshot.sectionKey(
+                x >> 4, y >> 4, z >> 4
+        );
 
         if (key != lastEntitySection) {
             lastEntitySection = key;
@@ -2035,5 +2043,51 @@ public class explosionstep {
                 processedUpdateType,
                 bucket.energy[cell]
         );
+    }
+
+    static double entityAbsorption(int armor) {
+        return 0.10 + 0.02
+                * Math.min(40, Math.max(0, armor));
+    }
+
+    private double entityTransmission(int x, int y, int z) {
+        if (damageSink == null) {
+            return 1.0;
+        }
+
+        List<EntitySnapshot.Hitbox> boxes =
+                hitboxesInSection(x, y, z);
+
+        if (boxes == null) {
+            return 1.0;
+        }
+
+        double transmission = 1.0;
+
+        for (int i = 0; i < boxes.size(); i++) {
+            EntitySnapshot.Hitbox box = boxes.get(i);
+
+            if (!box.intersectsCell(x, y, z)) {
+                continue;
+            }
+
+            boolean duplicate = false;
+
+            for (int j = 0; j < i; j++) {
+                EntitySnapshot.Hitbox previous = boxes.get(j);
+
+                if (previous.entityId == box.entityId
+                        && previous.intersectsCell(x, y, z)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate) {
+                transmission *= 1.0 - entityAbsorption(box.armor);
+            }
+        }
+
+        return transmission;
     }
 }

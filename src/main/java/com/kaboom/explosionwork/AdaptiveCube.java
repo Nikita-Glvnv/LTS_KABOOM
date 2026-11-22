@@ -66,6 +66,7 @@ public class AdaptiveCube {
     private final double[] rayArrivals = new double[3];
     private final TickBucket[] rayBuckets = new TickBucket[3];
     private boolean rayScheduleReady;
+    private double entityLoss;
 
     private static final class TickBucket {
         // 0 — слот не занят; индекс записи хранится с прибавленной единицей.
@@ -783,6 +784,52 @@ public class AdaptiveCube {
                     }
                 }
             }
+            if (damageBoxCount > 0) {
+                double transmission = 1.0;
+                int volume = size * size * size;
+
+                for (int j = 0; j < damageBoxCount; j++) {
+                    EntitySnapshot.Hitbox box =
+                            hitboxes.get(damageBoxIndexes[j]);
+
+                    boolean duplicate = false;
+
+                    for (int k = 0; k < j; k++) {
+                        if (hitboxes.get(damageBoxIndexes[k]).entityId
+                                == box.entityId) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+
+                    if (duplicate) {
+                        continue;
+                    }
+
+                    int covered = damageBoxCounts[j];
+
+                    for (int k = j + 1; k < damageBoxCount; k++) {
+                        if (hitboxes.get(damageBoxIndexes[k]).entityId
+                                == box.entityId) {
+                            covered = Math.max(covered, damageBoxCounts[k]);
+                        }
+                    }
+
+                    double coverage = (double) covered / volume;
+
+                    transmission *= 1.0
+                            - explosionstep.entityAbsorption(box.armor)
+                            * coverage;
+                }
+
+                entityLoss += scratch.energy * (1.0 - transmission);
+
+                scratch.energy *= transmission;
+                scratch.momentX *= transmission;
+                scratch.momentY *= transmission;
+                scratch.momentZ *= transmission;
+            }
+
             if (worldUpdateSink != null
                     && scratch.energy > 0.0
                     && ThreadLocalRandom.current().nextInt(16) == 0) {
@@ -831,12 +878,18 @@ public class AdaptiveCube {
     public double takeAirLoss() { double v = airLoss; airLoss = 0; return v; }
     public double takeEscapedEnergy() { double v = escapedEnergy; escapedEnergy = 0; return v; }
     public double takeCulledEnergy() { double v = culledEnergy; culledEnergy = 0; return v; }
+    public double takeEntityLoss() {
+        double value = entityLoss;
+        entityLoss = 0.0;
+        return value;
+    }
 
     public void clear() {
         incomingCount = 0;
         activePackets = 0;
         pendingExitObjects = 0;
         preparedOutgoing = 0.0;
+        entityLoss = 0.0;
         rayScheduleReady = false;
         Arrays.fill(rayBuckets, null);
         scheduled.clear();
@@ -963,4 +1016,5 @@ public class AdaptiveCube {
 
         return Math.max(0, end - first);
     }
+
 }
