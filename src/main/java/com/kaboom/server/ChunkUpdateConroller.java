@@ -179,15 +179,14 @@ public class ChunkUpdateConroller implements IWorldEventListener{
             IBlockState blockState = chunk.getBlockState(pos);
             Block block = blockState.getBlock();
 
-            if (!block.isAir(blockState, world, pos)) {
-                if (blockState.getMaterial().isLiquid()) {
-                    types[i] = oktoderevo.LIQUID;
-                } else {
-                    types[i] = oktoderevo.BLOCK;
-                    hardness[i] = blockState.getBlockHardness(world, pos);
-                    resistance[i] =
-                            block.getExplosionResistance((Entity) null);
-                }
+            if (chunksnapshot.isLiquidBlock(blockState)) {
+                types[i] = oktoderevo.LIQUID;
+            } else if (!block.isAir(blockState, world, pos)) {
+                types[i] = oktoderevo.BLOCK;
+
+                hardness[i] = blockState.getBlockHardness(world, pos);
+                resistance[i] =
+                        block.getExplosionResistance((Entity) null);
             }
 
             i++;

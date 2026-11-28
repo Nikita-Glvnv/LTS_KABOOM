@@ -10,6 +10,8 @@ import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.event.world.WorldEvent;
+import net.minecraftforge.fluids.FluidRegistry;
+import net.minecraftforge.fluids.IFluidBlock;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraft.entity.Entity;
@@ -85,6 +87,9 @@ public class chunksnapshot {
             this.sectionY = sectionY;
         }
     }
+
+    private final EntitySnapshot entitySnapshot =
+            new EntitySnapshot(this);
 
     private static final class TrackedChunk {
         final int dimensionId;
@@ -194,6 +199,24 @@ public class chunksnapshot {
         }
         LOGGER.info("Server snapshots initialized: worlds={}, requestsPerTick={}, initialSectionsPerTick={}",
                 DimensionManager.getWorlds().length, MAX_REQUESTS_PER_TICK, MAX_INITIAL_SECTIONS_PER_TICK);
+    }
+
+    boolean isTrackedSection(
+            int dimensionId,
+            int chunkX,
+            int chunkZ,
+            int sectionY
+    ) {
+        if (sectionY < 0 || sectionY >= 16) {
+            return false;
+        }
+
+        TrackedChunk tracked = getTrackedChunk(
+                dimensionId, chunkX, chunkZ
+        );
+
+        return tracked != null
+                && (tracked.requestedMask & (1 << sectionY)) != 0;
     }
 
     private TrackedChunk registerChunk(
@@ -505,12 +528,12 @@ public class chunksnapshot {
                             baseZ + z
                     );
 
-                    if (block.isAir(state, world, pos)) {
+                    if (isLiquidBlock(state)) {
+                        types[index] = oktoderevo.LIQUID;
                         continue;
                     }
 
-                    if (state.getMaterial().isLiquid()) {
-                        types[index] = oktoderevo.LIQUID;
+                    if (block.isAir(state, world, pos)) {
                         continue;
                     }
 
@@ -665,6 +688,16 @@ public class chunksnapshot {
             stage = "scan";
             stageStart = System.nanoTime();
             updateController.scanSections();
+            stage = "entities";
+            for (WorldServer world : DimensionManager.getWorlds()) {
+
+                int dimensionId = world.provider.getDimension();
+
+                entitySnapshot.captureAndSend(
+                        world,
+                        trackedChunks.containsKey(dimensionId)
+                );
+            }
             metrics.scanNanos += System.nanoTime() - stageStart;
         } catch (RuntimeException | Error e) {
             LOGGER.error("Server snapshot tick failed: stage=" + stage
@@ -804,6 +837,18 @@ public class chunksnapshot {
 
         return tracked != null
                 && tracked.initializedMask == 0xFFFF;
+    }
+
+    public void resetDimension(int dimensionId) {
+        unregisterDimension(dimensionId);
+    }
+
+    static boolean isLiquidBlock(IBlockState state) {
+        Block block = state.getBlock();
+
+        return state.getMaterial().isLiquid()
+                || block instanceof IFluidBlock
+                || FluidRegistry.lookupFluidForBlock(block) != null;
     }
 
     boolean offerUpdate(SnapshotUpdate update) {

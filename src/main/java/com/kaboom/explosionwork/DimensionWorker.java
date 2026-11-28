@@ -1,6 +1,9 @@
 package com.kaboom.explosionwork;
 
 import static com.kaboom.ModLogger.LOGGER;
+
+import java.util.ArrayDeque;
+import java.util.UUID;
 import java.util.concurrent.locks.LockSupport;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -11,14 +14,21 @@ import com.kaboom.server.DestroyApplyManager;
 import net.minecraft.util.math.BlockPos;
 
 public class DimensionWorker {
+    private static final boolean AIR_EFFECTS_ENABLED = false;
     private final int dimensionId;
     private final SnapshotManager snapshotManager;
+    private final explosionstep physics = new explosionstep();
 
-    private static final int MAX_SNAPSHOTS_PER_TICK = 4;
+    // Результаты завершённого физического шага,
+// ещё не полностью переданные серверному потоку.
+    private boolean pendingDestroyApply;
+    private int nextDestroyedToApply;
+
+    private static final int MAX_SNAPSHOTS_PER_TICK = 32;
     private static final long TICK_NANOS = 50_000_000L;
     private static final int MAX_EXPLOSIONS_PER_TICK = 64;
 
-    private final Queue<BlockPos> pendingExplosions =
+    private final Queue<ExplosionRequest> pendingExplosions =
             new ConcurrentLinkedQueue<>();
 
     private static final int LOG_INTERVAL_TICKS = 20;
@@ -30,10 +40,24 @@ public class DimensionWorker {
     private long explosionReady;
     private long explosionDeferred;
     private BlockPos processingPos;
-
     private final Thread workerThread;
     private volatile boolean running;
+    private volatile boolean failed;
     private boolean started;
+
+    public boolean hasFailed() {
+        return failed;
+    }
+    private static final class ExplosionRequest {
+
+        final BlockPos pos;
+        final int power;
+
+        ExplosionRequest(BlockPos pos, int power) {
+            this.pos = pos;
+            this.power = power;
+        }
+    }
 
     public synchronized void start() {
         if (started) {
@@ -82,6 +106,15 @@ public class DimensionWorker {
         long snapshotTimeNs = 0;
         long explosionTimeNs = 0;
         long maxTickTimeNs = 0;
+        long physicsSteps = 0;
+        long physicsVisitedCells = 0;
+        long physicsDeferredCells = 0;
+        long physicsDestroyedBlocks = 0;
+        long physicsPrefetchChecks = 0;
+
+        long physicsTimeNs = 0;
+        long maxPhysicsStepNs = 0;
+        int maxPhysicsCells = 0;
         boolean wasIdle = false;
         String stage = "startup";
 
@@ -101,6 +134,7 @@ public class DimensionWorker {
                 stage = "snapshots";
                 long start = System.nanoTime();
                 int processed = snapshotManager.processIncomingSnapshots(MAX_SNAPSHOTS_PER_TICK);
+                snapshotManager.processIncomingEntitySnapshots();
                 snapshotTimeNs += System.nanoTime() - start;
                 snapshots += processed;
                 if (processed == MAX_SNAPSHOTS_PER_TICK) {
@@ -108,17 +142,82 @@ public class DimensionWorker {
                 }
 
                 stage = "explosions";
+
                 long attemptsBefore = explosionAttempts;
                 start = System.nanoTime();
-                processPendingExplosions();
+
+                boolean waveWasActive =
+                        physics.hasPending() || pendingDestroyApply || !pendingDamage.isEmpty()|| !pendingWorldUpdates.isEmpty();
+
+// Нельзя рассчитывать следующий шаг, пока
+// разрушения предыдущего не переданы серверу.
+                if (flushPendingDamage()
+                        && flushPendingWorldUpdates()
+                        && (!pendingDestroyApply || applyPendingDestructions())) {
+
+                    // Регистрируем новые источники энергии.
+                    processPendingExplosions();
+
+                    // Расчёт выполняется только при наличии
+                    // активных или ожидающих волн.
+                    if (physics.hasPending()) {
+
+                        stage = "physics";
+
+                        long physicsStart = System.nanoTime();
+
+                        boolean finished = physics.step(
+                                snapshotManager,
+                                damageSink,
+                                worldUpdateSink
+                        );
+
+                        int activeCells = physics.getCellsLastStep();
+
+                        long duration = System.nanoTime() - physicsStart;
+
+                        physicsTimeNs += duration;
+                        maxPhysicsStepNs = Math.max(maxPhysicsStepNs, duration);
+                        maxPhysicsCells = Math.max(maxPhysicsCells, activeCells);
+
+                        if (finished) {
+                            physicsSteps++;
+
+                            physicsVisitedCells += activeCells;
+                            physicsDeferredCells += physics.getDeferredLastStep();
+                            physicsDestroyedBlocks += physics.destroyedCount();
+
+                            physicsPrefetchChecks +=
+                                    physics.getPrefetchedSectionsLastStep();
+                        }
+
+                        if (finished) {
+
+                            // Шаг завершён. Передаём его разрушения.
+                            pendingDestroyApply = true;
+
+                            stage = "apply destructions";
+                            applyPendingDestructions();
+                        }
+                    }
+                }
+
                 explosionTimeNs += System.nanoTime() - start;
-                long attemptsThisTick = explosionAttempts - attemptsBefore;
+
+                long attemptsThisTick =
+                        explosionAttempts - attemptsBefore;
+
                 if (attemptsThisTick == MAX_EXPLOSIONS_PER_TICK) {
                     explosionLimitHits++;
                 }
 
-                boolean idle = processed == 0 && attemptsThisTick == 0;
-                if (idle != wasIdle) {
+                boolean idle =
+                        processed == 0
+                                && attemptsThisTick == 0
+                                && !waveWasActive
+                                && !physics.hasPending()
+                                && !pendingDestroyApply && pendingWorldUpdates.isEmpty();
+                if (idle != wasIdle && pendingDamage.isEmpty()) {
                     LOGGER.debug("DimensionWorker state: dimension={}, state={}",
                             dimensionId, idle ? "idle" : "active");
                     wasIdle = idle;
@@ -134,7 +233,64 @@ public class DimensionWorker {
 
                 if (++ticks >= LOG_INTERVAL_TICKS) {
                     long acceptedNow = acceptedExplosions.get();
+                    if (physicsSteps > 0
+                            || physics.hasPending()
+                            || pendingDestroyApply) {
+
+                        LOGGER.info(
+                                "ExplosionPhysics stats: dimension={}, elapsedMs={}, " +
+                                        "waveTick={}, steps={}, processedCells={}, " +
+                                        "deferredCells={}, maxCellsInStep={}, " +
+                                        "destroyedBlocks={}, prefetchChecks={}, " +
+                                        "pendingCells={}, pendingDestroyBlocks={}, " +
+                                        "pendingApply={}, physicsTimeUs={}, maxStepUs={}, " +
+                                        "totalAbsorbed={}, totalAirAbsorbed={}, " +
+                                        "totalEscaped={}, totalCulled={}",
+
+                                dimensionId,
+                                (now - intervalStart) / 1_000_000L,
+                                physics.getCurrentTick(),
+                                physicsSteps,
+                                physicsVisitedCells - physicsDeferredCells,
+                                physicsDeferredCells,
+                                maxPhysicsCells,
+                                physicsDestroyedBlocks,
+                                physicsPrefetchChecks,
+                                physics.getPendingCellCount(),
+                                Math.max(
+                                        0,
+                                        physics.destroyedCount() - nextDestroyedToApply
+                                ),
+                                pendingDestroyApply,
+                                physicsTimeNs / 1_000L,
+                                maxPhysicsStepNs / 1_000L,
+                                physics.getAbsorbed(),
+                                physics.getAirAbsorbed(),
+                                physics.getEscaped(),
+                                physics.getCulled()
+                        );
+
+                        if (maxPhysicsStepNs > TICK_NANOS) {
+                            LOGGER.warn(
+                                    "ExplosionPhysics slow step: dimension={}, " +
+                                            "maxStepMs={}, targetTickMs={}",
+                                    dimensionId,
+                                    maxPhysicsStepNs / 1_000_000L,
+                                    TICK_NANOS / 1_000_000L
+                            );
+                        }
+                    }
                     long accepted = acceptedNow - acceptedAtLastReport;
+                    String adaptiveReport = physics.drainAdaptiveReport();
+
+                    if (adaptiveReport != null) {
+                        LOGGER.info(
+                                "AdaptiveCube stats: dimension={}, {}",
+                                dimensionId,
+                                adaptiveReport
+                        );
+                    }
+
                     if (accepted > 0 || snapshots > 0 || explosionAttempts > 0 || overruns > 0) {
                         LOGGER.info(
                                 "DimensionWorker stats: dimension={}, elapsedMs={}, ticks={}, accepted={}, snapshots={}, snapshotLimitHits={}, explosionAttempts={}, explosionReady={}, explosionDeferred={}, explosionLimitHits={}, queuedExplosions={}, overruns={}, snapshotTimeUs={}, explosionTimeUs={}, maxTickUs={}",
@@ -164,9 +320,20 @@ public class DimensionWorker {
                     ticks = snapshots = snapshotLimitHits = explosionLimitHits = overruns = 0;
                     explosionAttempts = explosionReady = explosionDeferred = 0;
                     snapshotTimeNs = explosionTimeNs = maxTickTimeNs = 0;
+                    physicsSteps = 0;
+                    physicsVisitedCells = 0;
+                    physicsDeferredCells = 0;
+                    physicsDestroyedBlocks = 0;
+                    physicsPrefetchChecks = 0;
+
+                    physicsTimeNs = 0;
+                    maxPhysicsStepNs = 0;
+                    maxPhysicsCells = 0;
                 }
             }
         } catch (RuntimeException | Error e) {
+            failed = true;
+            running = false;
             LOGGER.error(
                     "DimensionWorker failed: dimension=" + dimensionId
                             + ", stage=" + stage
@@ -193,59 +360,114 @@ public class DimensionWorker {
 
         for (int i = 0; i < count; i++) {
 
-            BlockPos pos = pendingExplosions.poll();
+            ExplosionRequest request = pendingExplosions.poll();
 
-            if (pos == null) {
+            if (request == null) {
                 break;
             }
 
+            BlockPos pos = request.pos;
             processingPos = pos;
             explosionAttempts++;
 
-            boolean ready = snapshotManager.getBlock(
+            // Убеждаемся, что начальная секция доступна.
+            if (!snapshotManager.getBlock(
                     pos.getX(),
                     pos.getY(),
                     pos.getZ(),
                     result
-            );
-
-            if (!ready) {
-                pendingExplosions.offer(pos);
+            )) {
+                pendingExplosions.offer(request);
                 explosionDeferred++;
                 processingPos = null;
                 continue;
             }
 
-            explosionReady++;
+            long packed = pos.toLong();
+
+            // Планируем начало взрыва на следующий
+            // физический тик. Это безопасно даже при
+            // частично обработанном текущем тике.
+            double arrival = physics.getCurrentTick() + 1.0;
+
+            physics.schedule(
+                    packed,
+                    packed,
+                    (double) request.power,
+                    0.0,
+                    0.0,
+                    0.0,
+                    arrival
+            );
+            submitWorldUpdate(
+                    pos.getX(),
+                    pos.getY(),
+                    pos.getZ(),
+                    DestroyApplyManager.WorldUpdateType.EXPLOSION_CENTER,
+                    request.power
+            );
             LOGGER.info(
-                    "Explosion block: dimension={}, pos={}, type={}, hardness={}, resistance={}",
+                    "ExplosionPhysics source activated: dimension={}, " +
+                            "pos={}, energy={}, arrivalTick={}",
                     dimensionId,
                     pos,
-                    result.type,
-                    result.hardness,
-                    result.resistance
+                    request.power,
+                    (long) arrival
             );
-            if (result.type != oktoderevo.AIR) {
 
-                DestroyApplyManager manager =
-                        Kaboom.getDestroyApplyManager();
+            explosionReady++;
 
-                if (manager != null
-                        && manager.submitDestroy(dimensionId, pos)) {
-
-                    snapshotManager.removeBlock(
-                            pos.getX(),
-                            pos.getY(),
-                            pos.getZ()
-                    );
-
-                } else {
-                    pendingExplosions.offer(pos);
-                    explosionDeferred++;
-                }
-            }
             processingPos = null;
         }
+    }
+
+    private boolean applyPendingDestructions() {
+
+        int count = physics.destroyedCount();
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (nextDestroyedToApply < count && manager == null) {
+            return false;
+        }
+
+        while (nextDestroyedToApply < count) {
+
+            long packed =
+                    physics.destroyedAt(nextDestroyedToApply);
+
+            BlockPos pos = BlockPos.fromLong(packed);
+
+            // Передаём разрушение на Server Thread.
+            if (!manager.submitDestroy(dimensionId, pos)) {
+                return false;
+            }
+
+            // После успешной постановки в серверную очередь
+            // обновляем снимок для дальнейших расчётов.
+            if (!snapshotManager.removeBlock(
+                    pos.getX(),
+                    pos.getY(),
+                    pos.getZ()
+            )) {
+                LOGGER.warn(
+                        "Failed to remove destroyed block from snapshot: dimension={}, pos={}",
+                        dimensionId, pos
+                );
+            }
+
+            // Увеличиваем индекс только после принятия
+            // разрушения серверной очередью.
+            nextDestroyedToApply++;
+        }
+
+        physics.clearDestroyed();
+
+        nextDestroyedToApply = 0;
+        pendingDestroyApply = false;
+
+        return true;
     }
 
     public DimensionWorker(int dimensionId) {
@@ -267,7 +489,9 @@ public class DimensionWorker {
                 pos.getZ()
         );
 
-        pendingExplosions.offer(capturedPos);
+        pendingExplosions.offer(
+                new ExplosionRequest(capturedPos, power)
+        );
         long totalAccepted = acceptedExplosions.incrementAndGet();
 
         LOGGER.info(
@@ -277,6 +501,177 @@ public class DimensionWorker {
     }
     public SnapshotManager getSnapshotManager() {
         return snapshotManager;
+    }
+
+    private static final class PendingDamage {
+        final int entityId;
+        final UUID uuid;
+        final int partIndex;
+        final double damage;
+
+        PendingDamage(
+                int entityId,
+                UUID uuid,
+                int partIndex,
+                double damage
+        ) {
+            this.entityId = entityId;
+            this.uuid = uuid;
+            this.partIndex = partIndex;
+            this.damage = damage;
+        }
+    }
+
+    private final ArrayDeque<PendingDamage> pendingDamage =
+            new ArrayDeque<>();
+
+    private final explosionstep.DamageSink damageSink =
+            this::submitEntityDamage;
+
+    private void submitEntityDamage(
+            int entityId,
+            UUID uuid,
+            int partIndex,
+            double damage
+    ) {
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (pendingDamage.isEmpty()
+                && manager != null
+                && manager.submitDamage(
+                dimensionId,
+                entityId,
+                uuid,
+                partIndex,
+                damage
+        )) {
+            return;
+        }
+
+        pendingDamage.addLast(
+                new PendingDamage(
+                        entityId,
+                        uuid,
+                        partIndex,
+                        damage
+                )
+        );
+    }
+    private boolean flushPendingDamage() {
+
+        if (pendingDamage.isEmpty()) {
+            return true;
+        }
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (manager == null) {
+            return false;
+        }
+
+        while (!pendingDamage.isEmpty()) {
+
+            PendingDamage hit = pendingDamage.peekFirst();
+
+            if (!manager.submitDamage(
+                    dimensionId,
+                    hit.entityId,
+                    hit.uuid,
+                    hit.partIndex,
+                    hit.damage
+            )) {
+                return false;
+            }
+
+            pendingDamage.removeFirst();
+        }
+
+        return true;
+    }
+
+    private static final class PendingWorldUpdate {
+        final int x, y, z;
+        final DestroyApplyManager.WorldUpdateType type;
+        final double energy;
+
+        PendingWorldUpdate(
+                int x, int y, int z,
+                DestroyApplyManager.WorldUpdateType type,
+                double energy
+        ) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.type = type;
+            this.energy = energy;
+        }
+    }
+
+    private final ArrayDeque<PendingWorldUpdate> pendingWorldUpdates =
+            new ArrayDeque<>();
+
+    private final explosionstep.WorldUpdateSink worldUpdateSink =
+            this::submitWorldUpdate;
+
+    private void submitWorldUpdate(
+            int x, int y, int z,
+            DestroyApplyManager.WorldUpdateType type,
+            double energy
+    ) {
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (type == DestroyApplyManager.WorldUpdateType.AIR
+                && !AIR_EFFECTS_ENABLED) {
+            return;
+        }
+
+        if (pendingWorldUpdates.isEmpty()
+                && manager != null
+                && manager.submitWorldUpdate(
+                dimensionId, x, y, z, type, energy
+        )) {
+            return;
+        }
+
+        pendingWorldUpdates.addLast(
+                new PendingWorldUpdate(x, y, z, type, energy)
+        );
+    }
+
+    private boolean flushPendingWorldUpdates() {
+        if (pendingWorldUpdates.isEmpty()) {
+            return true;
+        }
+
+        DestroyApplyManager manager =
+                Kaboom.getDestroyApplyManager();
+
+        if (manager == null) {
+            return false;
+        }
+
+        while (!pendingWorldUpdates.isEmpty()) {
+            PendingWorldUpdate request =
+                    pendingWorldUpdates.peekFirst();
+
+            if (!manager.submitWorldUpdate(
+                    dimensionId,
+                    request.x,
+                    request.y,
+                    request.z,
+                    request.type,
+                    request.energy
+            )) {
+                return false;
+            }
+
+            pendingWorldUpdates.removeFirst();
+        }
+
+        return true;
     }
 
     //snapshotManager.processIncomingSnapshots(4);
