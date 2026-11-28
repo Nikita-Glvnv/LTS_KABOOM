@@ -27,7 +27,9 @@ public class AdaptiveCube {
     private static final double[][][] DIRECTIONS = createDirections();
     private static final GeometryTable[] GEOMETRY_TABLES = createGeometryTables();
     private int[] damageBoxIndexes = new int[0];
-    private int[] damageBoxCounts = new int[0];
+    private double[] entityCellEnergy;
+    private double[] entityCellTransmission;
+    private boolean hasEntityCells;
 
     // Не обращается к WorldServer: получает данные только через receive().
     private final int x, y, z, size;
@@ -321,6 +323,12 @@ public class AdaptiveCube {
             int data = 6 * i;
             double distance = geometry.values[data];
             if (distance <= 0.0) continue;
+            energy *= traceEntityRay(
+                    packet.centerX, packet.centerY, packet.centerZ,
+                    dirs[i][0], dirs[i][1], dirs[i][2],
+                    energy, packet.energy
+            );
+            if (energy < MIN_ACTIVE_ENERGY) continue;
             diagnostics.attenuationCalls++;
             energy *= sectorTransmittance(packet.energy, distance);
             if (energy < MIN_ACTIVE_ENERGY) continue;
@@ -586,6 +594,11 @@ public class AdaptiveCube {
             int face = tx <= ty && tx <= tz ? 0 : ty <= tz ? 1 : 2;
             double distance = Math.min(tx, Math.min(ty, tz));
             if (!Double.isFinite(distance) || distance <= 0) continue;
+            energy *= traceEntityRay(
+                    ox, oy, oz, ux, uy, uz,
+                    energy, packet.energy
+            );
+            if (energy < MIN_ACTIVE_ENERGY) continue;
             diagnostics.attenuationCalls++;
             energy *= sectorTransmittance(packet.energy, distance);
             if (energy < MIN_ACTIVE_ENERGY) continue;
@@ -699,46 +712,9 @@ public class AdaptiveCube {
         if (previousTick != Long.MIN_VALUE && tick != previousTick + 1)
             throw new IllegalStateException("AdaptiveCube requires consecutive ticks");
         previousTick = tick;
-        int damageBoxCount = 0;
-
-        if (incomingCount > 0
-                && hitboxes != null
-                && damageSink != null) {
-
-            int count = hitboxes.size();
-
-            if (damageBoxIndexes.length < count) {
-                damageBoxIndexes = new int[count];
-                damageBoxCounts = new int[count];
-            }
-
-            for (int i = 0; i < count; i++) {
-                EntitySnapshot.Hitbox box = hitboxes.get(i);
-
-                int nx = overlapCells(
-                        box.minX, box.maxX, x, size
-                );
-
-                if (nx == 0) continue;
-
-                int ny = overlapCells(
-                        box.minY, box.maxY, y, size
-                );
-
-                if (ny == 0) continue;
-
-                int nz = overlapCells(
-                        box.minZ, box.maxZ, z, size
-                );
-
-                if (nz == 0) continue;
-
-                damageBoxIndexes[damageBoxCount] = i;
-                damageBoxCounts[damageBoxCount] = nx * ny * nz;
-
-                damageBoxCount++;
-            }
-        }
+        int damageBoxCount = prepareEntityCells(
+                hitboxes, damageSink
+        );
         for (int i = incomingCount - 1; i >= 0; i--) {
             int p = i * INPUT_STRIDE, off = inputOffset[i] & 65535;
             scratch.energy = inputData[p];
@@ -757,81 +733,11 @@ public class AdaptiveCube {
             scratch.exitCandidates = 0;
             preparedOutgoing = 0;
             double before = escapedEnergy;
+            double entityBefore = entityLoss;
             long start = System.nanoTime();
-            if (damageBoxCount > 0) {
-
-                double damage = explosionstep.entityDamage(
-                        scratch.energy / (size * size * size)
-                );
-
-                if (Double.isFinite(damage) && damage > 0.0) {
-
-                    for (int j = 0; j < damageBoxCount; j++) {
-
-                        EntitySnapshot.Hitbox box =
-                                hitboxes.get(damageBoxIndexes[j]);
-
-                        int intersections = damageBoxCounts[j];
-
-                        for (int k = 0; k < intersections; k++) {
-                            damageSink.hit(
-                                    box.entityId,
-                                    box.entityUuid,
-                                    box.partIndex,
-                                    damage
-                            );
-                        }
-                    }
-                }
-            }
-            if (damageBoxCount > 0) {
-                double transmission = 1.0;
-                int volume = size * size * size;
-
-                for (int j = 0; j < damageBoxCount; j++) {
-                    EntitySnapshot.Hitbox box =
-                            hitboxes.get(damageBoxIndexes[j]);
-
-                    boolean duplicate = false;
-
-                    for (int k = 0; k < j; k++) {
-                        if (hitboxes.get(damageBoxIndexes[k]).entityId
-                                == box.entityId) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-
-                    if (duplicate) {
-                        continue;
-                    }
-
-                    int covered = damageBoxCounts[j];
-
-                    for (int k = j + 1; k < damageBoxCount; k++) {
-                        if (hitboxes.get(damageBoxIndexes[k]).entityId
-                                == box.entityId) {
-                            covered = Math.max(covered, damageBoxCounts[k]);
-                        }
-                    }
-
-                    double coverage = (double) covered / volume;
-
-                    transmission *= 1.0
-                            - explosionstep.entityAbsorption(box.armor)
-                            * coverage;
-                }
-
-                entityLoss += scratch.energy * (1.0 - transmission);
-
-                scratch.energy *= transmission;
-                scratch.momentX *= transmission;
-                scratch.momentY *= transmission;
-                scratch.momentZ *= transmission;
-            }
-
+            prepare(scratch);
             if (worldUpdateSink != null
-                    && scratch.energy > 0.0
+                    && scratch.energy > entityLoss - entityBefore
                     && ThreadLocalRandom.current().nextInt(16) == 0) {
 
                 int volume = size * size * size;
@@ -846,10 +752,9 @@ public class AdaptiveCube {
                 worldUpdateSink.update(
                         bx, by, bz,
                         WorldUpdateType.AIR,
-                        scratch.energy / volume
+                        Math.max(0.0, scratch.energy - (entityLoss - entityBefore)) / volume
                 );
             }
-            prepare(scratch);
             long nanos = System.nanoTime() - start;
             diagnostics.prepared++;
             diagnostics.prepareNs += nanos;
@@ -857,7 +762,8 @@ public class AdaptiveCube {
             diagnostics.generatedEnergy += preparedOutgoing;
             diagnostics.maxExitsPerPacket = Math.max(diagnostics.maxExitsPerPacket,
                     scratch.exitCandidates);
-            airLoss += Math.max(0, scratch.energy - preparedOutgoing - (escapedEnergy - before));
+            airLoss += Math.max(0, scratch.energy - preparedOutgoing
+                    - (escapedEnergy - before) - (entityLoss - entityBefore));
             if (scratch.lastTick == Long.MIN_VALUE) {
                 activePackets--;
                 diagnostics.completed++;
@@ -867,6 +773,8 @@ public class AdaptiveCube {
                 bucket(scratch.lastTick).completedPackets++;
             }
         }
+        applyEntityCellDamage(hitboxes, damageSink, damageBoxCount);
+        hasEntityCells = false;
         incomingCount = 0;
         emitDue(tick, output);
     }
@@ -995,6 +903,209 @@ public class AdaptiveCube {
             prepareNs = maxPrepareNs = maxExitsPerPacket = 0;
             receivedEnergy = generatedEnergy = 0.0;
             emittedEnergy = culledEnergy = escapedEnergy = 0.0;
+        }
+    }
+
+
+    // Подготавливает клетки с сущностями, не обращаясь к игровому миру.
+    private int prepareEntityCells(
+            List<EntitySnapshot.Hitbox> hitboxes,
+            explosionstep.DamageSink damageSink
+    ) {
+        hasEntityCells = false;
+
+        if (incomingCount == 0 || hitboxes == null
+                || hitboxes.isEmpty() || damageSink == null) {
+            return 0;
+        }
+
+        int volume = size * size * size;
+        if (entityCellEnergy == null) {
+            entityCellEnergy = new double[volume];
+            entityCellTransmission = new double[volume];
+        }
+
+        Arrays.fill(entityCellEnergy, 0.0);
+        Arrays.fill(entityCellTransmission, 1.0);
+
+        if (damageBoxIndexes.length < hitboxes.size()) {
+            damageBoxIndexes = Arrays.copyOf(
+                    damageBoxIndexes, hitboxes.size()
+            );
+        }
+
+        int boxCount = 0;
+        for (int i = 0; i < hitboxes.size(); i++) {
+            EntitySnapshot.Hitbox box = hitboxes.get(i);
+            if (overlapCells(box.minX, box.maxX, x, size) == 0
+                    || overlapCells(box.minY, box.maxY, y, size) == 0
+                    || overlapCells(box.minZ, box.maxZ, z, size) == 0) {
+                continue;
+            }
+            damageBoxIndexes[boxCount++] = i;
+        }
+
+        for (int j = 0; j < boxCount; j++) {
+            EntitySnapshot.Hitbox box = hitboxes.get(damageBoxIndexes[j]);
+
+            for (int cz = Math.max(z, (int) Math.floor(box.minZ));
+                 cz < Math.min(z + size, (int) Math.ceil(box.maxZ));
+                 cz++) {
+                for (int cy = Math.max(y, (int) Math.floor(box.minY));
+                     cy < Math.min(y + size, (int) Math.ceil(box.maxY));
+                     cy++) {
+                    for (int cx = Math.max(x, (int) Math.floor(box.minX));
+                         cx < Math.min(x + size, (int) Math.ceil(box.maxX));
+                         cx++) {
+                        if (!box.intersectsCell(cx, cy, cz)) {
+                            continue;
+                        }
+
+                        boolean duplicate = false;
+                        for (int k = 0; k < j; k++) {
+                            EntitySnapshot.Hitbox previous =
+                                    hitboxes.get(damageBoxIndexes[k]);
+                            if (previous.entityId == box.entityId
+                                    && previous.intersectsCell(cx, cy, cz)) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (duplicate) {
+                            continue;
+                        }
+
+                        int index = (cx - x)
+                                + size * ((cy - y) + size * (cz - z));
+                        entityCellTransmission[index] *=
+                                1.0 - explosionstep.entityAbsorption(box.armor);
+                    }
+                }
+            }
+        }
+
+        hasEntityCells = boxCount > 0;
+        return boxCount;
+    }
+
+    // 3D DDA: считаем воздействие только в клетках, занятых сущностями.
+    // Возвращает долю энергии луча, прошедшую через все такие клетки.
+    private double traceEntityRay(
+            double ox, double oy, double oz,
+            double ux, double uy, double uz,
+            double rayEnergy, double packetEnergy
+    ) {
+        if (!hasEntityCells) {
+            return 1.0;
+        }
+
+        int cx = (int) Math.floor(ox);
+        int cy = (int) Math.floor(oy);
+        int cz = (int) Math.floor(oz);
+
+        int sx = ux > 1e-12 ? 1 : ux < -1e-12 ? -1 : 0;
+        int sy = uy > 1e-12 ? 1 : uy < -1e-12 ? -1 : 0;
+        int sz = uz > 1e-12 ? 1 : uz < -1e-12 ? -1 : 0;
+
+        double tx = sx > 0 ? (cx + 1.0 - ox) / ux
+                : sx < 0 ? (cx - ox) / ux
+                : Double.POSITIVE_INFINITY;
+        double ty = sy > 0 ? (cy + 1.0 - oy) / uy
+                : sy < 0 ? (cy - oy) / uy
+                : Double.POSITIVE_INFINITY;
+        double tz = sz > 0 ? (cz + 1.0 - oz) / uz
+                : sz < 0 ? (cz - oz) / uz
+                : Double.POSITIVE_INFINITY;
+
+        double dx = sx == 0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(ux);
+        double dy = sy == 0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(uy);
+        double dz = sz == 0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(uz);
+
+        double entry = 0.0;
+        double remaining = 1.0;
+
+        while (cx >= x && cx < x + size
+                && cy >= y && cy < y + size
+                && cz >= z && cz < z + size) {
+            int index = (cx - x)
+                    + size * ((cy - y) + size * (cz - z));
+            double transmission = entityCellTransmission[index];
+
+            if (transmission < 1.0) {
+                double incident = rayEnergy
+                        * remaining
+                        * sectorTransmittance(packetEnergy, entry);
+                if (incident >= MIN_ACTIVE_ENERGY) {
+                    entityCellEnergy[index] += incident;
+                    entityLoss += incident * (1.0 - transmission);
+                    remaining *= transmission;
+                }
+            }
+
+            double next = Math.min(tx, Math.min(ty, tz));
+            if (!Double.isFinite(next)) {
+                break;
+            }
+            if (tx <= next + 1e-10) {
+                cx += sx;
+                tx += dx;
+            }
+            if (ty <= next + 1e-10) {
+                cy += sy;
+                ty += dy;
+            }
+            if (tz <= next + 1e-10) {
+                cz += sz;
+                tz += dz;
+            }
+            entry = next;
+        }
+        return remaining;
+    }
+
+    // Сперва суммируем энергию лучей, затем считаем урон по клетке один раз.
+    private void applyEntityCellDamage(
+            List<EntitySnapshot.Hitbox> hitboxes,
+            explosionstep.DamageSink damageSink,
+            int damageBoxCount
+    ) {
+        if (!hasEntityCells) {
+            return;
+        }
+
+        int volume = size * size * size;
+        for (int i = 0; i < volume; i++) {
+            entityCellEnergy[i] =
+                    explosionstep.entityDamage(entityCellEnergy[i]);
+        }
+
+        for (int j = 0; j < damageBoxCount; j++) {
+            EntitySnapshot.Hitbox box = hitboxes.get(damageBoxIndexes[j]);
+            for (int cz = Math.max(z, (int) Math.floor(box.minZ));
+                 cz < Math.min(z + size, (int) Math.ceil(box.maxZ));
+                 cz++) {
+                for (int cy = Math.max(y, (int) Math.floor(box.minY));
+                     cy < Math.min(y + size, (int) Math.ceil(box.maxY));
+                     cy++) {
+                    for (int cx = Math.max(x, (int) Math.floor(box.minX));
+                         cx < Math.min(x + size, (int) Math.ceil(box.maxX));
+                         cx++) {
+                        if (!box.intersectsCell(cx, cy, cz)) {
+                            continue;
+                        }
+
+                        int index = (cx - x)
+                                + size * ((cy - y) + size * (cz - z));
+                        double damage = entityCellEnergy[index];
+                        if (Double.isFinite(damage) && damage > 0.0) {
+                            damageSink.hit(
+                                    box.entityId, box.entityUuid,
+                                    box.partIndex, damage
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

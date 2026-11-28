@@ -76,7 +76,7 @@ public class explosionstep {
 
         return 8.0
                 * (energy / (energy + 0.1))
-                * Math.sqrt(1.0 + energy / 25.0);
+                * Math.sqrt(1.0 + energy / 61.265);
     }
     @FunctionalInterface
     public interface DamageSink {
